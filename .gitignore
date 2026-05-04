@@ -12,7 +12,7 @@ session.env
 *.key
 id_*
 
-# Sensitive data
+# Real IP lists (use edge_nodes.example as template)
 edge_nodes.txt
 
 # Temp

@@ -1,86 +1,85 @@
-# NSX Edge Support Bundle Automation
+# NSX Edge Automations
 
-Bash automation kit for collecting and verifying **support bundles** on NSX Edge Nodes (NSX-T / VMware NSX).
+Bash automation toolkit for managing NSX Edge Nodes (NSX-T / VMware NSX).
 
-> **Notice:** This repository contains generic infrastructure automation scripts. No proprietary data, credentials, or environment-specific references are included.
+Designed to be extended: each use case lives in its own folder under `automations/`, all sharing a common SSH/auth library.
 
-## Features
-
-- Controlled enable/disable of root SSH access
-- Support bundle request via admin CLI
-- Automated verification of bundle generation (log + file presence)
-- Interactive IP list input (paste multi-line from clipboard)
-- SSH key (Ed25519) or password authentication
-- Free-form command executor in both admin and root modes
-- Connectivity and validation test script
-- Compatible with **Ubuntu/Debian (WSL included)** and **Oracle Linux / RHEL-family**
+> **Notice:** No proprietary data, credentials, environment-specific references, or real IP addresses are included in this repository.
 
 ## Repository Structure
 
 ```
 .
-├── src/
-│   ├── lib/
-│   │   └── common.sh             # Shared functions (SSH, credentials, IPs)
-│   ├── install_dependencies.sh   # Package installer (apt / dnf / yum)
-│   ├── setup_keys.sh             # SSH key generation and distribution
-│   ├── test_connections.sh       # Connectivity and command validation
-│   ├── nsx_sb_main.sh            # Main orchestrator (Phase 1 + Phase 2)
-│   ├── admin_exec.sh             # Ad-hoc admin CLI command executor
-│   └── root_exec.sh              # Ad-hoc root Linux command executor
+├── lib/
+│   └── common.sh                      # Shared: SSH, auth, IP loading, root control
+│
+├── automations/
+│   └── support_bundle/                # Use case: NSX support bundle collection
+│       ├── edge_nodes.example         # IP list template (copy to edge_nodes.txt)
+│       ├── install_dependencies.sh
+│       ├── setup_keys.sh
+│       ├── test_connections.sh
+│       ├── nsx_sb_main.sh
+│       ├── admin_exec.sh
+│       ├── root_exec.sh
+│       └── README.md
+│
 ├── docs/
-│   └── MANUAL.md                 # Usage guide and architecture
+│   ├── MANUAL.md                      # General usage guide
+│   └── CONTRIBUTING.md                # How to add a new automation
+│
 ├── examples/
-│   └── ip_list_example.txt       # Sample IP list format
+│   └── ip_list_example.txt
+│
 ├── .gitignore
 └── README.md
 ```
 
-## Requirements
-
-| Package | Ubuntu/Debian | Oracle Linux / RHEL |
-|---|---|---|
-| SSH client | `openssh-client` | `openssh-clients` |
-| SSH with password | `sshpass` | `sshpass` |
-| Interactive automation | `expect` | `expect` |
-| Persistent session | `screen` | `screen` |
-
 ## Quick Start
 
 ```bash
-cd src
-./install_dependencies.sh   # Install required packages
-./setup_keys.sh             # Generate and distribute SSH keys
-./test_connections.sh       # Validate environment (disables root SSH at end)
-./nsx_sb_main.sh            # Run full automation (disables root SSH at end)
+# 1. Go to the automation you need
+cd automations/support_bundle
+
+# 2. Create your IP list from the template
+cp edge_nodes.example edge_nodes.txt
+# Edit edge_nodes.txt with real IPs (never committed)
+
+# 3. Install dependencies
+./install_dependencies.sh
+
+# 4. Set up SSH keys (one time)
+./setup_keys.sh
+
+# 5. Test connections
+./test_connections.sh
+
+# 6. Run the automation
+./nsx_sb_main.sh
 ```
 
-### Running in background (recommended for long executions)
+## IP Address Management
 
-```bash
-screen -S nsx_sb
-cd src && ./nsx_sb_main.sh
-# Detach: Ctrl+A, D
-# Reattach: screen -r nsx_sb
+Each automation folder contains an `edge_nodes.example` file as a template.
+The actual `edge_nodes.txt` is **never committed** (covered by `.gitignore`).
+
 ```
+edge_nodes.example   ← versioned template, safe to commit
+edge_nodes.txt       ← your real IPs, local only, git-ignored
+```
+
+Populate by pasting IPs directly (one per line), or copying from a spreadsheet.
 
 ## Security
 
-- Passwords are collected interactively and cleared from memory with `unset` after use
-- Root SSH is enabled **only during execution** and disabled automatically at the end
-- SSH private keys are stored in `.ssh_keys/` which is covered by `.gitignore`
-- Session credential file (if created) is auto-removed after 30 minutes
+- Passwords collected interactively, cleared from memory after use
+- Root SSH enabled only during execution, disabled automatically at the end
+- SSH private keys stored in `.ssh_keys/` (git-ignored)
+- Session credential file auto-deleted after 30 minutes
 
-## Adjusting for Your NSX Version
+## Adding a New Automation
 
-Edit `src/lib/common.sh` to match your NSX CLI commands:
-
-```bash
-enable_root_ssh()    # Command to enable root login via SSH
-disable_root_ssh()   # Command to disable root login via SSH
-request_support_bundle()  # Command to trigger bundle generation
-check_support_bundle()    # Log/file paths to verify generation
-```
+See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
 
 ## License
 
