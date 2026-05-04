@@ -1,8 +1,6 @@
-# Example IP list for Edge Nodes
-# One IP per line. Paste directly when prompted by scripts.
-# Lines starting with # are ignored.
+# IP list example
+# Copy this format into any automation's edge_nodes.txt
+# One IPv4 per line. Lines starting with # are ignored.
 192.168.1.10
 192.168.1.11
 192.168.1.12
-192.168.1.13
-192.168.1.14

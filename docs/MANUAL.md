@@ -1,69 +1,46 @@
-# Usage Manual
+# General Usage Manual
 
-## Prerequisites
+## Repository Design
 
-- Edge Nodes reachable via SSH (port 22)
-- Admin user with permission to manage SSH service settings
-- CLI commands may vary by product version — adjust `src/lib/common.sh` as needed
+This toolkit follows a **shared library + isolated automations** pattern:
 
-## Architecture Overview
+```
+lib/common.sh          ← single source of truth for SSH, auth, IP loading
+automations/<name>/    ← self-contained folder per use case
+```
 
-### Phase 1 — Request
-1. Enables root SSH on each Edge Node (via admin CLI)
-2. Triggers support bundle generation
-3. Logs status per node to `logs/sb_status_<timestamp>.csv`
+Each automation:
+- Sources `../../lib/common.sh`
+- Sets `export AUTO_DIR="${SCRIPT_DIR}"` before sourcing, so logs, keys and IP file resolve to its own folder
+- Contains its own `edge_nodes.example` template
 
-### Phase 2 — Verification
-1. Waits ~30 minutes (configurable)
-2. Checks every 5 minutes:
-   - Reads `/var/log/support_bundle` log file
-   - Searches for `.tgz`/`.tar.gz` bundle files
-   - Detects active generation processes
-3. Stops early on error detection
-4. Disables root SSH on all nodes at completion
+## IP File Convention
 
-## Variables
-
-| Variable | Description | Lifetime |
+| File | Committed | Purpose |
 |---|---|---|
-| `NSX_USER` | Admin username | Session |
-| `NSX_PASS` | Admin password | Cleared after 30 min |
-| `ROOT_PASS` | Root password (if no key) | Cleared after use |
+| `edge_nodes.example` | ✅ Yes | Template, no real IPs |
+| `edge_nodes.txt` | ❌ No (git-ignored) | Your real IP list |
 
-## SSH Key Flow
+Populate `edge_nodes.txt` by:
+1. Copying the example: `cp edge_nodes.example edge_nodes.txt`
+2. Editing with real IPs (one per line)
+3. Or pasting directly when the script prompts you
 
-```
-[setup_keys.sh]
-  ├── Generates: .ssh_keys/nsx_admin_key (Ed25519)
-  ├── Generates: .ssh_keys/nsx_root_key  (Ed25519)
-  └── Distributes pubkeys via:
-       admin: 'set user admin ssh-key "<pubkey>"'
-       root:  'set user root ssh-key "<pubkey>"'
-```
+## Credentials Lifecycle
 
-After initial setup, all subsequent connections use keys — no password needed.
+| Credential | When collected | When cleared |
+|---|---|---|
+| `NSX_PASS` | Start of script | `unset` after use / 30-min auto-clear |
+| `ROOT_PASS` | Per-node when no key | `unset` immediately after each node |
+| SSH keys | Once via `setup_keys.sh` | Never — stored in `.ssh_keys/` (git-ignored) |
 
-## Log Files
+## Root SSH Policy
 
-| File | Content |
-|---|---|
-| `logs/sb_run_<ts>.log` | Full execution log |
-| `logs/sb_status_<ts>.csv` | Per-node status (ip, phase, status, details, timestamp) |
-| `logs/test_<ts>.log` | Test run output |
+- **Enabled** only at the moment an automation needs root access
+- **Disabled** immediately after each node completes
+- **Disabled** on all nodes in the FINAL cleanup step
+- `test_connections.sh` also disables root SSH after validation
 
-## Migrating Between Distros
+## Adding a New Automation
 
-`install_dependencies.sh` reads `/etc/os-release` to detect:
-- Ubuntu/Debian → `apt-get`
-- Oracle Linux, RHEL, CentOS, Rocky, AlmaLinux, Fedora → `dnf` or `yum`
-
-## Customization
-
-All shared functions are in `src/lib/common.sh`. Key functions to review:
-
-```bash
-enable_root_ssh(ip)         # Adjust NSX CLI command for your version
-disable_root_ssh(ip)        # Adjust NSX CLI command for your version
-request_support_bundle(ip)  # Adjust SB trigger command
-check_support_bundle(ip)    # Adjust file paths and grep patterns
-```
+See [CONTRIBUTING.md](CONTRIBUTING.md).

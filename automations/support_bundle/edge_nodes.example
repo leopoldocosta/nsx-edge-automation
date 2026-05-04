@@ -1,0 +1,14 @@
+# edge_nodes.example
+# Template for NSX Edge Node IP list.
+#
+# HOW TO USE:
+#   cp edge_nodes.example edge_nodes.txt
+#   Edit edge_nodes.txt with your real IPs.
+#   edge_nodes.txt is git-ignored and will never be committed.
+#
+# FORMAT: one IPv4 address per line. Lines starting with # are ignored.
+#
+# Example:
+# 192.168.10.10
+# 192.168.10.11
+# 192.168.10.12
