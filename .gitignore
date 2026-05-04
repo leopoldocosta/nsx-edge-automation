@@ -1,0 +1,21 @@
+# Runtime and logs
+logs/
+run/
+*.log
+*.csv
+.env
+session.env
+
+# SSH keys (never commit)
+.ssh_keys/
+*.pem
+*.key
+id_*
+
+# Sensitive data
+edge_nodes.txt
+
+# Temp
+*.swp
+*.tmp
+__pycache__/
