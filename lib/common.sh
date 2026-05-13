@@ -5,14 +5,13 @@
 #
 # Usage in any automation script:
 #   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+#   export AUTO_DIR="${SCRIPT_DIR}"
 #   source "${SCRIPT_DIR}/../../lib/common.sh"
 set -euo pipefail
 
-# Resolve LIB_DIR and derive BASE_DIR (repo root = two levels above lib/)
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(cd "${LIB_DIR}/.." && pwd)"
 
-# Caller automation dir (overridden by each script before sourcing if needed)
 AUTO_DIR="${AUTO_DIR:-$(pwd)}"
 
 LOG_DIR="${AUTO_DIR}/logs"
@@ -28,10 +27,10 @@ mkdir -p "${LOG_DIR}" "${RUN_DIR}" "${KEY_DIR}"
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-log(){ printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
-log_ok(){   log "[OK]   $*"; }
-log_warn(){ log "[WARN] $*"; }
-log_err(){  log "[ERR]  $*"; }
+log(){      printf '[%s] %s\n'        "$(date '+%F %T')" "$*"; }
+log_ok(){   printf '[%s] [OK]   %s\n' "$(date '+%F %T')" "$*"; }
+log_warn(){ printf '[%s] [WARN] %s\n' "$(date '+%F %T')" "$*"; }
+log_err(){  printf '[%s] [ERR]  %s\n' "$(date '+%F %T')" "$*"; }
 
 # ---------------------------------------------------------------------------
 # Dependency check
@@ -45,12 +44,12 @@ need_cmd(){
 
 # ---------------------------------------------------------------------------
 # IP Management
-# IP file lives in the automation's own directory (edge_nodes.txt).
-# Never versioned. Template: edge_nodes.example
+# IPs live in edge_nodes.txt inside each automation's own folder.
+# Never committed. Template: edge_nodes.example
 # ---------------------------------------------------------------------------
 collect_ips(){
   if [[ -f "${EDGE_EXAMPLE}" ]]; then
-    echo "Template available: ${EDGE_EXAMPLE}"
+    echo "  Template available: ${EDGE_EXAMPLE}"
     echo "  Copy with: cp edge_nodes.example edge_nodes.txt, then edit."
     echo "  Or paste IPs directly below."
   fi
@@ -86,17 +85,58 @@ load_ips(){
 
 # ---------------------------------------------------------------------------
 # Credentials
+# Passwords are stored internally as raw strings (read -r).
+# When passed to sshpass, they are written to a temp file (fd) to avoid
+# shell word-splitting and to handle any special characters safely.
+# Collected ONCE and reused for all nodes.
 # ---------------------------------------------------------------------------
 ask_admin_creds(){
-  read -rp "Admin username [admin]: " NSX_USER
+  # Skip if already set (e.g. re-sourcing the lib)
+  if [[ -n "${NSX_PASS:-}" ]]; then
+    log "Admin credentials already loaded, skipping prompt."
+    return 0
+  fi
+  read -rp  "Admin username [admin]: " NSX_USER
   NSX_USER="${NSX_USER:-admin}"
-  read -rsp "Admin password: " NSX_PASS; echo
+  # IFS= read -r preserves every character including backslashes and special chars
+  IFS= read -rsp "Admin password (all special characters accepted): " NSX_PASS; echo
   export NSX_USER NSX_PASS
+  log "Credentials collected for user '${NSX_USER}'. Will be reused for all nodes."
+}
+
+ask_root_creds(){
+  if [[ -n "${ROOT_PASS:-}" ]]; then
+    log "Root credentials already loaded, skipping prompt."
+    return 0
+  fi
+  IFS= read -rsp "Root password (all special characters accepted): " ROOT_PASS; echo
+  export ROOT_PASS
+  log "Root credentials collected. Will be reused for all nodes."
 }
 
 clear_creds(){
   unset NSX_PASS ROOT_PASS NSX_USER 2>/dev/null || true
   log "Credentials cleared from memory."
+}
+
+# ---------------------------------------------------------------------------
+# SSH helper: write password to a private temp file, pass via SSHPASS env var.
+# This avoids exposing the password in process args and handles any char safely.
+# ---------------------------------------------------------------------------
+_sshpass_safe(){
+  # $1 = password variable name (NSX_PASS or ROOT_PASS)
+  # remaining args = ssh command
+  local _passvar="$1"; shift
+  local _pass="${!_passvar}"
+  local _tmpfile
+  _tmpfile="$(mktemp -t sshpass_XXXXXX)"
+  chmod 600 "${_tmpfile}"
+  # Write raw password to file — no shell interpretation
+  printf '%s' "${_pass}" > "${_tmpfile}"
+  SSHPASS="$(cat "${_tmpfile}")" sshpass -e "$@"
+  local _rc=$?
+  rm -f "${_tmpfile}"
+  return $_rc
 }
 
 # ---------------------------------------------------------------------------
@@ -112,7 +152,7 @@ ssh_admin(){
         -o BatchMode=yes \
         "admin@${ip}" "$@"
   else
-    sshpass -p "${NSX_PASS}" ssh \
+    _sshpass_safe NSX_PASS ssh \
         -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=15 \
@@ -130,7 +170,7 @@ ssh_root(){
         -o BatchMode=yes \
         "root@${ip}" "$@"
   else
-    sshpass -p "${ROOT_PASS}" ssh \
+    _sshpass_safe ROOT_PASS ssh \
         -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=15 \
@@ -138,19 +178,11 @@ ssh_root(){
   fi
 }
 
-admin_cmd(){
-  local ip="$1" cmd="$2"
-  ssh_admin "$ip" "$cmd" 2>&1
-}
-
-root_cmd(){
-  local ip="$1" cmd="$2"
-  ssh_root "$ip" "$cmd" 2>&1
-}
+admin_cmd(){ local ip="$1" cmd="$2"; ssh_admin "$ip" "$cmd" 2>&1; }
+root_cmd(){  local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>&1; }
 
 # ---------------------------------------------------------------------------
 # Root SSH Control
-# Adjust these commands to match your NSX version CLI.
 # ---------------------------------------------------------------------------
 enable_root_ssh(){
   local ip="$1"
@@ -165,8 +197,7 @@ disable_root_ssh(){
 }
 
 # ---------------------------------------------------------------------------
-# Support Bundle (specific to support_bundle automation — kept here for reuse)
-# Adjust paths and commands as needed for your NSX version.
+# Support Bundle helpers
 # ---------------------------------------------------------------------------
 request_support_bundle(){
   local ip="$1"
