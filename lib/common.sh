@@ -44,12 +44,10 @@ need_cmd(){
 
 # ---------------------------------------------------------------------------
 # IP Management
-# IPs live in edge_nodes.txt inside each automation's own folder.
-# Never committed. Template: edge_nodes.example
 # ---------------------------------------------------------------------------
 collect_ips(){
   if [[ -f "${EDGE_EXAMPLE}" ]]; then
-    echo "  Template available: ${EDGE_EXAMPLE}"
+    echo "  Template: ${EDGE_EXAMPLE}"
     echo "  Copy with: cp edge_nodes.example edge_nodes.txt, then edit."
     echo "  Or paste IPs directly below."
   fi
@@ -85,20 +83,16 @@ load_ips(){
 
 # ---------------------------------------------------------------------------
 # Credentials
-# Passwords are stored internally as raw strings (read -r).
-# When passed to sshpass, they are written to a temp file (fd) to avoid
-# shell word-splitting and to handle any special characters safely.
-# Collected ONCE and reused for all nodes.
+# Coletadas UMA vez e reutilizadas em todos os nos.
+# ask_admin_creds e ask_root_creds sao no-op se as variaveis ja existirem.
 # ---------------------------------------------------------------------------
 ask_admin_creds(){
-  # Skip if already set (e.g. re-sourcing the lib)
   if [[ -n "${NSX_PASS:-}" ]]; then
     log "Admin credentials already loaded, skipping prompt."
     return 0
   fi
   read -rp  "Admin username [admin]: " NSX_USER
   NSX_USER="${NSX_USER:-admin}"
-  # IFS= read -r preserves every character including backslashes and special chars
   IFS= read -rsp "Admin password (all special characters accepted): " NSX_PASS; echo
   export NSX_USER NSX_PASS
   log "Credentials collected for user '${NSX_USER}'. Will be reused for all nodes."
@@ -120,18 +114,15 @@ clear_creds(){
 }
 
 # ---------------------------------------------------------------------------
-# SSH helper: write password to a private temp file, pass via SSHPASS env var.
-# This avoids exposing the password in process args and handles any char safely.
+# SSH helper: escreve senha em arquivo temporario privado para evitar
+# exposicao em argumentos de processo. Funciona com qualquer caractere especial.
 # ---------------------------------------------------------------------------
 _sshpass_safe(){
-  # $1 = password variable name (NSX_PASS or ROOT_PASS)
-  # remaining args = ssh command
   local _passvar="$1"; shift
   local _pass="${!_passvar}"
   local _tmpfile
   _tmpfile="$(mktemp -t sshpass_XXXXXX)"
   chmod 600 "${_tmpfile}"
-  # Write raw password to file — no shell interpretation
   printf '%s' "${_pass}" > "${_tmpfile}"
   SSHPASS="$(cat "${_tmpfile}")" sshpass -e "$@"
   local _rc=$?
@@ -178,22 +169,38 @@ ssh_root(){
   fi
 }
 
-admin_cmd(){ local ip="$1" cmd="$2"; ssh_admin "$ip" "$cmd" 2>&1; }
-root_cmd(){  local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>&1; }
+# Exibe o comando enviado no terminal (stderr) antes de executar
+admin_cmd(){
+  local ip="$1" cmd="$2"
+  printf '[CMD] admin@%s >>> %s\n' "$ip" "$cmd" >&2
+  ssh_admin "$ip" "$cmd" 2>&1
+}
+
+root_cmd(){
+  local ip="$1" cmd="$2"
+  printf '[CMD] root@%s >>> %s\n' "$ip" "$cmd" >&2
+  ssh_root "$ip" "$cmd" 2>&1
+}
 
 # ---------------------------------------------------------------------------
-# Root SSH Control
+# Root SSH Control — comandos corretos NSX-T Edge
+# Habilitar : start service ssh  +  set ssh root-login
+# Desabilitar: clear ssh root-login
+# Validar   : get service ssh
 # ---------------------------------------------------------------------------
 enable_root_ssh(){
   local ip="$1"
   log "${ip}: enabling root SSH..."
-  admin_cmd "$ip" 'set service ssh enabled; start service ssh; set service ssh root-login enabled' || true
+  admin_cmd "$ip" 'start service ssh'  || true
+  admin_cmd "$ip" 'set ssh root-login' || true
+  admin_cmd "$ip" 'get service ssh'    || true
 }
 
 disable_root_ssh(){
   local ip="$1"
   log "${ip}: disabling root SSH..."
-  admin_cmd "$ip" 'set service ssh root-login disabled' || true
+  admin_cmd "$ip" 'clear ssh root-login' || true
+  admin_cmd "$ip" 'get service ssh'       || true
 }
 
 # ---------------------------------------------------------------------------
