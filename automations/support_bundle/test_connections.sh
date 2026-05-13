@@ -7,7 +7,13 @@ source "${SCRIPT_DIR}/../../lib/common.sh"
 
 need_cmd ssh
 load_ips
+
+# Credenciais admin: coletadas uma vez, reutilizadas em todos os nos
 [[ -f "${ADMIN_KEY}" ]] || { need_cmd sshpass; ask_admin_creds; }
+
+# Credenciais root: coletadas uma vez, reutilizadas em todos os nos
+# Nao pede novamente dentro do loop
+[[ -f "${ROOT_KEY}" ]] || ask_root_creds
 
 REPORT="${LOG_DIR}/test_$(date +%Y%m%d_%H%M%S).log"
 log "Test report: ${REPORT}"
@@ -34,8 +40,6 @@ for ip in "${EDGE_IPS[@]}"; do
     enable_root_ssh "$ip"
     sleep 2
 
-    [[ -f "${ROOT_KEY}" ]] || { read -rsp "Root password for ${ip}: " ROOT_PASS; echo; export ROOT_PASS; }
-
     echo "--- [6] root: uname -a ---"
     root_cmd "$ip" 'uname -a' || echo "FAIL"
 
@@ -51,7 +55,6 @@ for ip in "${EDGE_IPS[@]}"; do
     echo "--- [10] disable root SSH ---"
     disable_root_ssh "$ip"
 
-    unset ROOT_PASS 2>/dev/null || true
     echo
   } | tee -a "$REPORT"
 done
