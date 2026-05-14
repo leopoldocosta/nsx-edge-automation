@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v2.2
+# deploy_nsx_sb_check.sh  v2.3
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
 # USO:
@@ -34,7 +34,7 @@ mkdir -p \
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v2.2"
+echo "  NSX Edge Automation — Support Bundle Kit  v2.3"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -75,11 +75,11 @@ session.env
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh  — v2.2
+# lib/common.sh  — v2.3
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh  — v2.2
+# lib/common.sh  — v2.3
 # Biblioteca compartilhada para todos os scripts NSX Edge Automation.
 # Autenticação: sempre sshpass (senha). Sem chaves SSH.
 set -euo pipefail
@@ -365,11 +365,16 @@ request_support_bundle(){
   admin_cmd "$ip" "get support-bundle file ${fname} log-age 1" || true
 }
 
+# ---------------------------------------------------------------------------
+# check_support_bundle IP
+#   Verifica o status da geração do support bundle no node via root SSH.
+#   FIX v2.3: path corrigido para /var/log/support_bundle.log (com extensão .log)
+# ---------------------------------------------------------------------------
 check_support_bundle(){
   local ip="$1"
   local out_log out_files out_root
   out_log="$(root_cmd "$ip" \
-    "test -f /var/log/support_bundle && tail -50 /var/log/support_bundle || echo FILE_NOT_FOUND")"
+    "test -f /var/log/support_bundle.log && tail -50 /var/log/support_bundle.log || echo FILE_NOT_FOUND")"
   out_files="$(root_cmd "$ip" \
     "find /var/log /storage /tmp -maxdepth 3 \( -name '*support*bundle*' -o -name '*.tgz' -o -name '*.tar.gz' \) -type f 2>/dev/null | head -20")"
   out_root="$(root_cmd "$ip" "getent passwd root >/dev/null 2>&1; echo ROOT_OK")"
@@ -479,8 +484,8 @@ for ip in "${EDGE_IPS[@]}"; do
     echo "--- [8] root: df -h /var/log ---"
     root_cmd "$ip" 'df -h /var/log' || echo "FAIL"
 
-    echo "--- [9] presença do log support_bundle ---"
-    root_cmd "$ip" 'ls -lh /var/log/support_bundle 2>/dev/null || echo FILE_NOT_FOUND'
+    echo "--- [9] presença do log support_bundle.log ---"
+    root_cmd "$ip" 'ls -lh /var/log/support_bundle.log 2>/dev/null || echo FILE_NOT_FOUND'
 
     echo "--- [10] disable root SSH ---"
     disable_root_ssh "$ip"
@@ -495,11 +500,11 @@ TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_main.sh  — v2.2  (PRE-CHECK com check_bundle_log + check_existing_bundle)
+# nsx_sb_main.sh  — v2.3  (PRE-CHECK com check_bundle_log + check_existing_bundle)
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v2.2
+# nsx_sb_main.sh  — v2.3
 # Orquestrador: PRE-CHECK + Fase 1 (solicitar SB) + Fase 2 (verificar a cada 5 min)
 # PRE-CHECK:
 #   1. check_bundle_log()       — lê /var/log/support_bundle.log (últimas 10 linhas)
@@ -811,8 +816,16 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "================================================================"
-echo "  Deploy concluído! v2.2"
+echo "  Deploy concluído! v2.3"
 echo "================================================================"
+echo ""
+echo "  Novidades v2.3:"
+echo "    - BUG FIX: check_support_bundle() corrigido"
+echo "      Path /var/log/support_bundle → /var/log/support_bundle.log"
+echo "      Elimina FILE_NOT_FOUND falso-positivo que mantinha todos"
+echo "      os nodes em status 'pending' por todas as 6 rodadas."
+echo "    - BUG FIX: test_connections.sh passo [9] corrigido"
+echo "      ls -lh /var/log/support_bundle → support_bundle.log"
 echo ""
 echo "  Novidades v2.2:"
 echo "    - check_bundle_log(): lê /var/log/support_bundle.log"
