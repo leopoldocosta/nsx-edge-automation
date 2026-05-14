@@ -5,6 +5,10 @@
 #
 # Authentication: always sshpass (password-based). No SSH key logic.
 #
+# Credential persistence: when user chooses NOT to clear credentials,
+# they are saved to a tmpfs session file (/dev/shm or /tmp) with mode 600.
+# The file is removed by clear_creds or when the session is explicitly cleared.
+#
 # Usage in any automation script:
 #   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #   export AUTO_DIR="${SCRIPT_DIR}"
@@ -22,6 +26,11 @@ EDGE_FILE="${AUTO_DIR}/edge_nodes.txt"
 EDGE_EXAMPLE="${AUTO_DIR}/edge_nodes.example"
 
 mkdir -p "${LOG_DIR}" "${RUN_DIR}"
+
+# Session credential file — stored in tmpfs (memory only, never on disk)
+_CRED_DIR="/tmp"
+[[ -d "/dev/shm" ]] && _CRED_DIR="/dev/shm"
+_CRED_FILE="${_CRED_DIR}/.nsx_session_${UID}"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -81,42 +90,102 @@ load_ips(){
 }
 
 # ---------------------------------------------------------------------------
+# Session file helpers — tmpfs only (memory, never disk)
+# ---------------------------------------------------------------------------
+_save_creds(){
+  # Uses printf to write each variable on its own line.
+  # Values are written verbatim; no quoting that could break special chars.
+  (
+    umask 177  # ensures file is created 600 even on write
+    printf 'NSX_USER=%s\n'  "${NSX_USER:-}"  > "${_CRED_FILE}"
+    printf 'NSX_PASS=%s\n'  "${NSX_PASS:-}"  >> "${_CRED_FILE}"
+    printf 'ROOT_PASS=%s\n' "${ROOT_PASS:-}" >> "${_CRED_FILE}"
+  )
+  chmod 600 "${_CRED_FILE}"
+}
+
+_load_creds(){
+  # Only load if file exists and belongs to current user
+  [[ -f "${_CRED_FILE}" ]] || return 1
+  local file_uid
+  file_uid="$(stat -c '%u' "${_CRED_FILE}" 2>/dev/null || stat -f '%u' "${_CRED_FILE}" 2>/dev/null || echo -1)"
+  [[ "${file_uid}" == "${UID}" ]] || return 1
+
+  local key val
+  while IFS= read -r _line; do
+    [[ -z "${_line}" || "${_line}" =~ ^# ]] && continue
+    key="${_line%%=*}"
+    val="${_line#*=}"
+    case "${key}" in
+      NSX_USER)  export NSX_USER="${val}"  ;;
+      NSX_PASS)  export NSX_PASS="${val}"  ;;
+      ROOT_PASS) export ROOT_PASS="${val}" ;;
+    esac
+  done < "${_CRED_FILE}"
+  return 0
+}
+
+_remove_cred_file(){
+  [[ -f "${_CRED_FILE}" ]] && rm -f "${_CRED_FILE}" || true
+}
+
+# ---------------------------------------------------------------------------
 # Credentials
 # Collected interactively ONCE per session and reused for all nodes.
-# Passwords stored in memory only (never written to disk).
+# Passwords stored in memory only (session file in /dev/shm, never on disk).
 # ---------------------------------------------------------------------------
 ask_admin_creds(){
+  # 1. Already in environment (same process tree)
   if [[ -n "${NSX_PASS:-}" ]]; then
-    log "Admin credentials already loaded, skipping prompt."
+    log "Admin credentials already in environment (user: '${NSX_USER:-admin}'). Skipping prompt."
     return 0
   fi
-  read -rp  "Admin username [admin]: " NSX_USER
+  # 2. Try session file (set by a previous script run)
+  if _load_creds 2>/dev/null; then
+    if [[ -n "${NSX_PASS:-}" ]]; then
+      log "Admin credentials loaded from session file (user: '${NSX_USER:-admin}'). Skipping prompt."
+      return 0
+    fi
+  fi
+  # 3. Interactive prompt
+  read -rp  "Usuário admin [admin]: " NSX_USER
   NSX_USER="${NSX_USER:-admin}"
-  IFS= read -rsp "Admin password (all special characters accepted): " NSX_PASS; echo
+  IFS= read -rsp "Senha admin (todos os caracteres especiais aceitos): " NSX_PASS; echo
   export NSX_USER NSX_PASS
-  log "Credentials collected for user '${NSX_USER}'. Will be reused for all nodes."
+  log "Credenciais coletadas para o usuário '${NSX_USER}'. Serão reutilizadas em todos os nós."
 }
 
 ask_root_creds(){
+  # 1. Already in environment
   if [[ -n "${ROOT_PASS:-}" ]]; then
-    log "Root credentials already loaded, skipping prompt."
+    log "Root credentials already in environment. Skipping prompt."
     return 0
   fi
-  IFS= read -rsp "Root password (all special characters accepted): " ROOT_PASS; echo
+  # 2. Try session file
+  if _load_creds 2>/dev/null; then
+    if [[ -n "${ROOT_PASS:-}" ]]; then
+      log "Root credentials loaded from session file. Skipping prompt."
+      return 0
+    fi
+  fi
+  # 3. Interactive prompt
+  IFS= read -rsp "Senha root (todos os caracteres especiais aceitos): " ROOT_PASS; echo
   export ROOT_PASS
   log "Root credentials collected. Will be reused for all nodes."
 }
 
 clear_creds(){
   unset NSX_PASS ROOT_PASS NSX_USER 2>/dev/null || true
-  log "Credentials cleared from memory."
+  _remove_cred_file
+  log "Credentials cleared from memory and session file removed."
 }
 
 prompt_clear_creds(){
   echo ""
-  read -rp "Clear credentials from memory? [S/n]: " _CLR
+  read -rp "Limpar credenciais da memória? [S/n]: " _CLR
   if [[ "${_CLR,,}" == "n" ]]; then
-    log "Credentials kept in session."
+    _save_creds
+    log "Credenciais mantidas na sessão (${_CRED_FILE})."
   else
     clear_creds
   fi
