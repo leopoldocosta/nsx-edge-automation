@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v2.3
+# deploy_nsx_sb_check.sh  v2.4
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
 # USO:
@@ -34,7 +34,7 @@ mkdir -p \
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v2.3"
+echo "  NSX Edge Automation — Support Bundle Kit  v2.4"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -75,13 +75,23 @@ session.env
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh  — v2.3
+# lib/common.sh  — v2.4
+# FIX: credential persistence via tmpfs session file (/dev/shm)
+# FIX: persistent known_hosts per UID — elimina aviso "Permanently added"
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh  — v2.3
+# lib/common.sh  — v2.4
 # Biblioteca compartilhada para todos os scripts NSX Edge Automation.
 # Autenticação: sempre sshpass (senha). Sem chaves SSH.
+#
+# FIX v2.4:
+#   - Credenciais persistidas em /dev/shm/.nsx_session_<UID> (tmpfs, chmod 600)
+#     quando usuário responde "n" ao prompt de limpeza.
+#     Scripts subsequentes carregam automaticamente sem novo prompt.
+#   - known_hosts persistente em /tmp/.nsx_known_hosts_<UID> (chmod 600).
+#     Aviso "Permanently added" ocorre apenas na PRIMEIRA conexão a cada IP.
+#     Conexões subsequentes são silenciosas.
 set -euo pipefail
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -93,6 +103,15 @@ EDGE_FILE="${AUTO_DIR}/edge_nodes.txt"
 EDGE_EXAMPLE="${AUTO_DIR}/edge_nodes.example"
 
 mkdir -p "${LOG_DIR}" "${RUN_DIR}"
+
+# Session credential file — tmpfs (memória, nunca disco)
+_CRED_DIR="/tmp"
+[[ -d "/dev/shm" ]] && _CRED_DIR="/dev/shm"
+_CRED_FILE="${_CRED_DIR}/.nsx_session_${UID}"
+
+# Persistent known_hosts per UID — suprime aviso "Permanently added"
+_KNOWN_HOSTS="/tmp/.nsx_known_hosts_${UID}"
+touch "${_KNOWN_HOSTS}" 2>/dev/null && chmod 600 "${_KNOWN_HOSTS}" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -152,13 +171,60 @@ load_ips(){
 }
 
 # ---------------------------------------------------------------------------
+# Session file helpers — tmpfs only (memória, nunca disco)
+# ---------------------------------------------------------------------------
+_save_creds(){
+  (
+    umask 177
+    printf 'NSX_USER=%s\n'  "${NSX_USER:-}"  > "${_CRED_FILE}"
+    printf 'NSX_PASS=%s\n'  "${NSX_PASS:-}"  >> "${_CRED_FILE}"
+    printf 'ROOT_PASS=%s\n' "${ROOT_PASS:-}" >> "${_CRED_FILE}"
+  )
+  chmod 600 "${_CRED_FILE}"
+}
+
+_load_creds(){
+  [[ -f "${_CRED_FILE}" ]] || return 1
+  local file_uid
+  file_uid="$(stat -c '%u' "${_CRED_FILE}" 2>/dev/null \
+           || stat -f '%u' "${_CRED_FILE}" 2>/dev/null \
+           || echo -1)"
+  [[ "${file_uid}" == "${UID}" ]] || return 1
+  local key val
+  while IFS= read -r _line; do
+    [[ -z "${_line}" || "${_line}" =~ ^# ]] && continue
+    key="${_line%%=*}"
+    val="${_line#*=}"
+    case "${key}" in
+      NSX_USER)  export NSX_USER="${val}"  ;;
+      NSX_PASS)  export NSX_PASS="${val}"  ;;
+      ROOT_PASS) export ROOT_PASS="${val}" ;;
+    esac
+  done < "${_CRED_FILE}"
+  return 0
+}
+
+_remove_cred_file(){
+  [[ -f "${_CRED_FILE}" ]] && rm -f "${_CRED_FILE}" || true
+}
+
+# ---------------------------------------------------------------------------
 # Credenciais — coletadas interativamente UMA VEZ e reutilizadas
 # ---------------------------------------------------------------------------
 ask_admin_creds(){
+  # 1. Já no ambiente (mesma árvore de processo)
   if [[ -n "${NSX_PASS:-}" ]]; then
-    log "Credenciais admin já carregadas, pulando prompt."
+    log "Credenciais admin já no ambiente (usuário: '${NSX_USER:-admin}'). Pulando prompt."
     return 0
   fi
+  # 2. Tenta arquivo de sessão (gravado por script anterior)
+  if _load_creds 2>/dev/null; then
+    if [[ -n "${NSX_PASS:-}" ]]; then
+      log "Credenciais admin carregadas do arquivo de sessão (usuário: '${NSX_USER:-admin}'). Pulando prompt."
+      return 0
+    fi
+  fi
+  # 3. Prompt interativo
   read -rp  "Usuário admin [admin]: " NSX_USER
   NSX_USER="${NSX_USER:-admin}"
   IFS= read -rsp "Senha admin (todos os caracteres especiais aceitos): " NSX_PASS; echo
@@ -167,10 +233,19 @@ ask_admin_creds(){
 }
 
 ask_root_creds(){
+  # 1. Já no ambiente
   if [[ -n "${ROOT_PASS:-}" ]]; then
-    log "Credenciais root já carregadas, pulando prompt."
+    log "Credenciais root já no ambiente. Pulando prompt."
     return 0
   fi
+  # 2. Tenta arquivo de sessão
+  if _load_creds 2>/dev/null; then
+    if [[ -n "${ROOT_PASS:-}" ]]; then
+      log "Credenciais root carregadas do arquivo de sessão. Pulando prompt."
+      return 0
+    fi
+  fi
+  # 3. Prompt interativo
   IFS= read -rsp "Senha root (todos os caracteres especiais aceitos): " ROOT_PASS; echo
   export ROOT_PASS
   log "Credenciais root coletadas. Serão reutilizadas em todos os nodes."
@@ -178,14 +253,17 @@ ask_root_creds(){
 
 clear_creds(){
   unset NSX_PASS ROOT_PASS NSX_USER 2>/dev/null || true
-  log "Credenciais removidas da memória."
+  _remove_cred_file
+  [[ -f "${_KNOWN_HOSTS}" ]] && rm -f "${_KNOWN_HOSTS}" || true
+  log "Credenciais removidas da memória, arquivo de sessão e known_hosts apagados."
 }
 
 prompt_clear_creds(){
   echo ""
   read -rp "Limpar credenciais da memória? [S/n]: " _CLR
   if [[ "${_CLR,,}" == "n" ]]; then
-    log "Credenciais mantidas na sessão."
+    _save_creds
+    log "Credenciais mantidas na sessão (${_CRED_FILE})."
   else
     clear_creds
   fi
@@ -193,13 +271,15 @@ prompt_clear_creds(){
 
 # ---------------------------------------------------------------------------
 # SSH — sempre via sshpass (senha). Sem chaves SSH.
+# StrictHostKeyChecking=accept-new: aceita automaticamente hosts novos,
+# reutiliza entradas existentes — sem aviso "Permanently added" repetido.
 # ---------------------------------------------------------------------------
 ssh_admin(){
   local ip="$1"; shift
   export SSHPASS="${NSX_PASS}"
   sshpass -e ssh \
-      -o StrictHostKeyChecking=no \
-      -o UserKnownHostsFile=/dev/null \
+      -o StrictHostKeyChecking=accept-new \
+      -o UserKnownHostsFile="${_KNOWN_HOSTS}" \
       -o ConnectTimeout=15 \
       "${NSX_USER}@${ip}" "$@"
   local _rc=$?
@@ -211,8 +291,8 @@ ssh_root(){
   local ip="$1"; shift
   export SSHPASS="${ROOT_PASS}"
   sshpass -e ssh \
-      -o StrictHostKeyChecking=no \
-      -o UserKnownHostsFile=/dev/null \
+      -o StrictHostKeyChecking=accept-new \
+      -o UserKnownHostsFile="${_KNOWN_HOSTS}" \
       -o ConnectTimeout=15 \
       "root@${ip}" "$@"
   local _rc=$?
@@ -246,13 +326,6 @@ disable_root_ssh(){
 
 # ---------------------------------------------------------------------------
 # check_bundle_log IP
-#   Lê /var/log/support_bundle.log no node e exibe as últimas 10 linhas.
-#   Detecta palavras-chave de erro/aviso e destaca no terminal.
-#   Requer root SSH habilitado.
-#   Retorna:
-#     0  — log encontrado sem erros
-#     1  — log encontrado COM erros/avisos (imprime aviso no terminal)
-#     2  — arquivo não encontrado
 # ---------------------------------------------------------------------------
 check_bundle_log(){
   local ip="$1"
@@ -267,7 +340,6 @@ check_bundle_log(){
     return 2
   fi
 
-  # Exibe as 10 linhas no terminal
   echo ""
   echo "  ┌─ ${ip}: ${log_file} (últimas 10 linhas) ─────────────────────"
   while IFS= read -r line; do
@@ -276,7 +348,6 @@ check_bundle_log(){
   echo "  └────────────────────────────────────────────────────────────────"
   echo ""
 
-  # Verifica erros/avisos
   if grep -qiE 'error|fail|exception|abort|fatal|warn' <<< "$out"; then
     log_warn "${ip}: ATENÇÃO — problemas detectados no log da geração anterior (ver acima)."
     return 1
@@ -288,16 +359,11 @@ check_bundle_log(){
 
 # ---------------------------------------------------------------------------
 # check_existing_bundle IP
-#   Detecta se já existe um support bundle no nó, usando duas estratégias:
-#   Estratégia 1 (admin): executa 'get files' e filtra linhas com support-bundle
-#   Estratégia 2 (root) : ls /var/vmware/nsx/file-store/support-bundle*
-#   Retorna 0 com nomes de arquivo no stdout se encontrado, 1 caso contrário.
 # ---------------------------------------------------------------------------
 check_existing_bundle(){
   local ip="$1"
   local found_files=""
 
-  # Estratégia 1: admin 'get files'
   local admin_out
   admin_out="$(admin_cmd "$ip" 'get files' 2>/dev/null || true)"
   if [[ -n "$admin_out" ]]; then
@@ -306,7 +372,6 @@ check_existing_bundle(){
     [[ -n "$admin_matches" ]] && found_files="$admin_matches"
   fi
 
-  # Estratégia 2: root ls no file-store (requer root SSH habilitado)
   if [[ -z "$found_files" ]]; then
     local root_out
     root_out="$(root_cmd "$ip" \
@@ -325,9 +390,6 @@ check_existing_bundle(){
 
 # ---------------------------------------------------------------------------
 # prompt_new_bundle IP FILES
-#   Pergunta ao usuário se deseja gerar um NOVO bundle quando já existe um.
-#   Timeout de 10 segundos sem resposta = skip automático (padrão: não).
-#   Retorna 0 para gerar novo, 1 para pular.
 # ---------------------------------------------------------------------------
 prompt_new_bundle(){
   local ip="$1"
@@ -365,11 +427,6 @@ request_support_bundle(){
   admin_cmd "$ip" "get support-bundle file ${fname} log-age 1" || true
 }
 
-# ---------------------------------------------------------------------------
-# check_support_bundle IP
-#   Verifica o status da geração do support bundle no node via root SSH.
-#   FIX v2.3: path corrigido para /var/log/support_bundle.log (com extensão .log)
-# ---------------------------------------------------------------------------
 check_support_bundle(){
   local ip="$1"
   local out_log out_files out_root
@@ -500,17 +557,12 @@ TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_main.sh  — v2.3  (PRE-CHECK com check_bundle_log + check_existing_bundle)
+# nsx_sb_main.sh  — v2.4
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v2.3
+# nsx_sb_main.sh  — v2.4
 # Orquestrador: PRE-CHECK + Fase 1 (solicitar SB) + Fase 2 (verificar a cada 5 min)
-# PRE-CHECK:
-#   1. check_bundle_log()       — lê /var/log/support_bundle.log (últimas 10 linhas)
-#   2. check_existing_bundle()  — detecta bundle já gerado no node
-#   3. prompt_new_bundle()      — pergunta se gera novo (timeout 10s → skip)
-# Recomendado: rodar dentro de screen ou tmux (~35 min no total)
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -535,11 +587,8 @@ done
 
 for ip in "${EDGE_IPS[@]}"; do
   log "${ip}: iniciando PRE-CHECK..."
-
-  # Habilita root SSH (necessário para check_bundle_log e check_existing_bundle)
   enable_root_ssh "$ip"
 
-  # [1] Verifica log da geração anterior
   log_rc=0
   check_bundle_log "$ip" || log_rc=$?
   case "$log_rc" in
@@ -548,7 +597,6 @@ for ip in "${EDGE_IPS[@]}"; do
     2) printf '%s,precheck,bundle_log,not_found,%s\n'    "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV" ;;
   esac
 
-  # [2] Verifica bundle existente
   existing_files=""
   if existing_files="$(check_existing_bundle "$ip")"; then
     log "${ip}: bundle(s) existente(s) encontrado(s)."
@@ -724,8 +772,8 @@ fi
 
 log "Conectando em ${LOGIN_USER}@${TARGET_IP}..."
 sshpass -e ssh \
-  -o StrictHostKeyChecking=no \
-  -o UserKnownHostsFile=/dev/null \
+  -o StrictHostKeyChecking=accept-new \
+  -o UserKnownHostsFile="${_KNOWN_HOSTS}" \
   -o ConnectTimeout=15 \
   "${LOGIN_USER}@${TARGET_IP}"
 unset SSHPASS
@@ -748,7 +796,7 @@ cat > "${DOCS_DIR}/MANUAL.md" <<'MANUALDOC'
 ### 1. Deploy (primeira vez ou após reinstalação)
 
 ```bash
-bash deploy_nsx_sb_check.sh
+curl -fsSL https://raw.githubusercontent.com/leopoldocosta/nsx-edge-automation/main/automations/support_bundle/deploy_nsx_sb_check.sh | bash
 ```
 
 ### 2. Testar conectividade
@@ -763,12 +811,6 @@ cd ~/nsx-edge-automation/automations/support_bundle
 ```bash
 ./nsx_sb_main.sh
 ```
-
-O script executa um PRE-CHECK completo antes de gerar qualquer bundle:
-1. **check_bundle_log** — lê `/var/log/support_bundle.log` e exibe as últimas 10 linhas.
-   Detecta erros/avisos automaticamente e alerta no terminal.
-2. **check_existing_bundle** — verifica se já existe um bundle gerado.
-3. **prompt_new_bundle** — se encontrar bundle, pergunta se gera novo (timeout 10s → não).
 
 ### 4. Executar comando em todos os nodes
 
@@ -786,8 +828,17 @@ O script executa um PRE-CHECK completo antes de gerar qualquer bundle:
 ## Autenticação
 
 Todos os scripts pedem usuário e senha interativamente na primeira execução.
-As credenciais ficam em memória durante a sessão e são apagadas ao final.
-Nunca são escritas em disco.
+Quando o usuário responde "n" ao prompt de limpeza, as credenciais são salvas
+em `/dev/shm/.nsx_session_<UID>` (tmpfs, chmod 600) e recarregadas
+automaticamente pelo próximo script — sem novo prompt.
+Nunca são escritas em disco permanente.
+
+## Known Hosts
+
+Um arquivo `/tmp/.nsx_known_hosts_<UID>` (chmod 600) é mantido entre execuções.
+O aviso "Permanently added" aparece apenas na **primeira** conexão a cada IP.
+Conexões subsequentes são silenciosas.
+O arquivo é removido automaticamente ao responder "S" (limpar credenciais).
 MANUALDOC
 
 # ---------------------------------------------------------------------------
@@ -816,27 +867,20 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "================================================================"
-echo "  Deploy concluído! v2.3"
+echo "  Deploy concluído! v2.4"
 echo "================================================================"
 echo ""
+echo "  Novidades v2.4:"
+echo "    - FIX: known_hosts persistente por UID em /tmp/.nsx_known_hosts_<UID>"
+echo "      Aviso 'Permanently added' ocorre só na 1ª conexão a cada IP."
+echo "      StrictHostKeyChecking=accept-new substitui 'no' — mais seguro."
+echo "    - FIX: credenciais persistidas em /dev/shm/.nsx_session_<UID>"
+echo "      Scripts subsequentes carregam automaticamente sem novo prompt."
+echo "    - deploy sincronizado com todas as correções do lib/common.sh"
+echo ""
 echo "  Novidades v2.3:"
-echo "    - BUG FIX: check_support_bundle() corrigido"
-echo "      Path /var/log/support_bundle → /var/log/support_bundle.log"
-echo "      Elimina FILE_NOT_FOUND falso-positivo que mantinha todos"
-echo "      os nodes em status 'pending' por todas as 6 rodadas."
+echo "    - BUG FIX: check_support_bundle() path corrigido (.log)"
 echo "    - BUG FIX: test_connections.sh passo [9] corrigido"
-echo "      ls -lh /var/log/support_bundle → support_bundle.log"
-echo ""
-echo "  Novidades v2.2:"
-echo "    - check_bundle_log(): lê /var/log/support_bundle.log"
-echo "      Exibe últimas 10 linhas no terminal durante o PRE-CHECK"
-echo "      Detecta error|fail|exception|abort|fatal|warn no log"
-echo "    - PRE-CHECK agora: log → bundle existente → prompt"
-echo ""
-echo "  Novidades v2.1:"
-echo "    - PRE-CHECK: detecta bundles existentes antes de gerar novos"
-echo "    - admin 'get files' + root ls /var/vmware/nsx/file-store/"
-echo "    - Prompt interativo com timeout de 10s (padrão: não gerar)"
 echo ""
 echo "Próximos passos:"
 echo "  1. Edite o arquivo de IPs:"

@@ -9,6 +9,10 @@
 # they are saved to a tmpfs session file (/dev/shm or /tmp) with mode 600.
 # The file is removed by clear_creds or when the session is explicitly cleared.
 #
+# Known hosts: uses a persistent per-UID file in /tmp so the
+# "Permanently added ... to known hosts" warning is suppressed on
+# subsequent connections to the same IPs.
+#
 # Usage in any automation script:
 #   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #   export AUTO_DIR="${SCRIPT_DIR}"
@@ -27,10 +31,18 @@ EDGE_EXAMPLE="${AUTO_DIR}/edge_nodes.example"
 
 mkdir -p "${LOG_DIR}" "${RUN_DIR}"
 
+# ---------------------------------------------------------------------------
 # Session credential file — stored in tmpfs (memory only, never on disk)
+# ---------------------------------------------------------------------------
 _CRED_DIR="/tmp"
 [[ -d "/dev/shm" ]] && _CRED_DIR="/dev/shm"
 _CRED_FILE="${_CRED_DIR}/.nsx_session_${UID}"
+
+# ---------------------------------------------------------------------------
+# Persistent known_hosts file — suppresses repeated "Permanently added" warnings
+# ---------------------------------------------------------------------------
+_KNOWN_HOSTS="/tmp/.nsx_known_hosts_${UID}"
+touch "${_KNOWN_HOSTS}" 2>/dev/null && chmod 600 "${_KNOWN_HOSTS}" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -93,10 +105,8 @@ load_ips(){
 # Session file helpers — tmpfs only (memory, never disk)
 # ---------------------------------------------------------------------------
 _save_creds(){
-  # Uses printf to write each variable on its own line.
-  # Values are written verbatim; no quoting that could break special chars.
   (
-    umask 177  # ensures file is created 600 even on write
+    umask 177
     printf 'NSX_USER=%s\n'  "${NSX_USER:-}"  > "${_CRED_FILE}"
     printf 'NSX_PASS=%s\n'  "${NSX_PASS:-}"  >> "${_CRED_FILE}"
     printf 'ROOT_PASS=%s\n' "${ROOT_PASS:-}" >> "${_CRED_FILE}"
@@ -105,12 +115,12 @@ _save_creds(){
 }
 
 _load_creds(){
-  # Only load if file exists and belongs to current user
   [[ -f "${_CRED_FILE}" ]] || return 1
   local file_uid
-  file_uid="$(stat -c '%u' "${_CRED_FILE}" 2>/dev/null || stat -f '%u' "${_CRED_FILE}" 2>/dev/null || echo -1)"
+  file_uid="$(stat -c '%u' "${_CRED_FILE}" 2>/dev/null \
+           || stat -f '%u' "${_CRED_FILE}" 2>/dev/null \
+           || echo -1)"
   [[ "${file_uid}" == "${UID}" ]] || return 1
-
   local key val
   while IFS= read -r _line; do
     [[ -z "${_line}" || "${_line}" =~ ^# ]] && continue
@@ -177,7 +187,8 @@ ask_root_creds(){
 clear_creds(){
   unset NSX_PASS ROOT_PASS NSX_USER 2>/dev/null || true
   _remove_cred_file
-  log "Credentials cleared from memory and session file removed."
+  [[ -f "${_KNOWN_HOSTS}" ]] && rm -f "${_KNOWN_HOSTS}" || true
+  log "Credentials cleared from memory, session file and known_hosts removed."
 }
 
 prompt_clear_creds(){
@@ -193,14 +204,16 @@ prompt_clear_creds(){
 
 # ---------------------------------------------------------------------------
 # SSH Functions — always password-based via sshpass
-# SSHPASS is set immediately before each call and unset right after.
+# _KNOWN_HOSTS is a persistent per-UID file so "Permanently added" warnings
+# only appear the very first time each IP is seen. Subsequent calls are silent.
+# StrictHostKeyChecking=accept-new: auto-accept unknown hosts, never re-prompt.
 # ---------------------------------------------------------------------------
 ssh_admin(){
   local ip="$1"; shift
   export SSHPASS="${NSX_PASS}"
   sshpass -e ssh \
-      -o StrictHostKeyChecking=no \
-      -o UserKnownHostsFile=/dev/null \
+      -o StrictHostKeyChecking=accept-new \
+      -o UserKnownHostsFile="${_KNOWN_HOSTS}" \
       -o ConnectTimeout=15 \
       "${NSX_USER}@${ip}" "$@"
   local _rc=$?
@@ -212,8 +225,8 @@ ssh_root(){
   local ip="$1"; shift
   export SSHPASS="${ROOT_PASS}"
   sshpass -e ssh \
-      -o StrictHostKeyChecking=no \
-      -o UserKnownHostsFile=/dev/null \
+      -o StrictHostKeyChecking=accept-new \
+      -o UserKnownHostsFile="${_KNOWN_HOSTS}" \
       -o ConnectTimeout=15 \
       "root@${ip}" "$@"
   local _rc=$?
