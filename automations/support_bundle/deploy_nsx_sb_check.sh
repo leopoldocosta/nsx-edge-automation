@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v2.5
+# deploy_nsx_sb_check.sh  v2.6
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
 # USO:
@@ -35,7 +35,7 @@ mkdir -p \
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v2.5"
+echo "  NSX Edge Automation — Support Bundle Kit  v2.6"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -76,30 +76,19 @@ session.env
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh  — v2.5
-# FIX: stderr isolated from stdout in admin_cmd/root_cmd
-#      SSH warnings never contaminate captured output
-# FIX: credential persistence via /dev/shm session file
-# FIX: persistent known_hosts per UID
-# FIX: check_bundle_log no longer false-triggers on 'warn' SSH lines
+# lib/common.sh  — v2.6
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh  — v2.5
+# lib/common.sh  — v2.6
 # Biblioteca compartilhada para todos os scripts NSX Edge Automation.
 # Autenticação: sempre sshpass (senha). Sem chaves SSH.
 #
+# FIX v2.6:
+#   - nsx_sb_main.sh: exibe última linha de support_bundle.log no WARN pending
 # FIX v2.5:
 #   - admin_cmd/root_cmd: stderr suprimido (2>/dev/null)
-#     Avisos SSH ("Warning: Permanently added") nunca contaminam o stdout
-#     capturado, eliminando:
-#       * Falso-positivo em check_existing_bundle (bundle detectado
-#         quando só havia o aviso SSH na saída)
-#       * Falso-positivo em check_bundle_log ("warn" no aviso SSH
-#         disparava alerta ATENÇÃO mesmo com log NSX limpo)
 #   - admin_cmd_tty/root_cmd_tty: stdout+stderr no terminal
-#     Usado em enable/disable_root_ssh e request_support_bundle
-#     para que o operador veja a saída ao vivo
 # FIX v2.4:
 #   - Credenciais persistidas em /dev/shm/.nsx_session_<UID> (tmpfs)
 #   - known_hosts persistente em /tmp/.nsx_known_hosts_<UID>
@@ -115,12 +104,10 @@ EDGE_EXAMPLE="${AUTO_DIR}/edge_nodes.example"
 
 mkdir -p "${LOG_DIR}" "${RUN_DIR}"
 
-# Session credential file — tmpfs (memória, nunca disco)
 _CRED_DIR="/tmp"
 [[ -d "/dev/shm" ]] && _CRED_DIR="/dev/shm"
 _CRED_FILE="${_CRED_DIR}/.nsx_session_${UID}"
 
-# Persistent known_hosts per UID
 _KNOWN_HOSTS="/tmp/.nsx_known_hosts_${UID}"
 touch "${_KNOWN_HOSTS}" 2>/dev/null && chmod 600 "${_KNOWN_HOSTS}" 2>/dev/null || true
 
@@ -275,14 +262,7 @@ prompt_clear_creds(){
 }
 
 # ---------------------------------------------------------------------------
-# SSH — sempre via sshpass (senha). Sem chaves SSH.
-#
-# ssh_admin / ssh_root  : SSH bruto, stderr vai ao terminal (uso interativo)
-# admin_cmd / root_cmd  : captura apenas stdout; stderr suprimido (2>/dev/null)
-#   Usado em check_existing_bundle, check_bundle_log, check_support_bundle:
-#   avisos SSH nunca contaminam o output capturado.
-# admin_cmd_tty / root_cmd_tty : stdout+stderr no terminal
-#   Usado em enable/disable_root_ssh e request_support_bundle.
+# SSH
 # ---------------------------------------------------------------------------
 ssh_admin(){
   local ip="$1"; shift
@@ -316,7 +296,7 @@ admin_cmd_tty(){ local ip="$1" cmd="$2"; ssh_admin "$ip" "$cmd" 2>&1; }
 root_cmd_tty(){  local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>&1; }
 
 # ---------------------------------------------------------------------------
-# Root SSH Control — usa *_tty para output ao vivo no terminal
+# Root SSH Control
 # ---------------------------------------------------------------------------
 enable_root_ssh(){
   local ip="$1"
@@ -360,7 +340,6 @@ check_bundle_log(){
   echo "  └────────────────────────────────────────────────────────────────"
   echo ""
 
-  # grep apenas por erros reais do NSX; 'warn' removido para não capturar linhas SSH
   if grep -qiE 'error|fail|exception|abort|fatal' <<< "$out"; then
     log_warn "${ip}: ATENÇÃO — problemas detectados no log da geração anterior (ver acima)."
     return 1
@@ -495,8 +474,6 @@ cat > "${AUTO_DIR}/setup_keys.sh" <<'SETUP'
 #!/usr/bin/env bash
 # setup_keys.sh — placeholder
 # Chaves SSH não são usadas nesta versão.
-# A autenticação é sempre por senha via sshpass.
-# Execute test_connections.sh para validar a conectividade.
 echo "[INFO] Chaves SSH não são usadas nesta versão."
 echo "[INFO] Autenticação via sshpass (senha)."
 echo "[INFO] Execute ./test_connections.sh para validar."
@@ -570,11 +547,12 @@ TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_main.sh  — v2.5
+# nsx_sb_main.sh  — v2.6
+# FIX v2.6: exibe última linha de support_bundle.log no WARN pending
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v2.5
+# nsx_sb_main.sh  — v2.6
 # Orquestrador: PRE-CHECK + Fase 1 (solicitar SB) + Fase 2 (verificar a cada 5 min)
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -662,7 +640,11 @@ for ((round=1; round<=6; round++)); do
       printf '%s,phase2,success,%q,%s\n' "$ip" "$OUT" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
       NODE_DONE["$ip"]="true"
     else
-      log_warn "${ip}: ainda pendente..."
+      # Still pending — fetch last line of support_bundle.log for live progress
+      LAST_LOG_LINE="$(root_cmd "$ip" \
+        "test -f /var/log/support_bundle.log && tail -1 /var/log/support_bundle.log || echo '(log not found)'" \
+        2>/dev/null || echo '(ssh error)')"
+      log_warn "${ip}: ainda pendente... | last log: ${LAST_LOG_LINE}"
       printf '%s,phase2,pending,%q,%s\n' "$ip" "$OUT" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
     fi
   done
@@ -878,22 +860,17 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "================================================================"
-echo "  Deploy concluído! v2.5"
+echo "  Deploy concluído! v2.6"
 echo "================================================================"
 echo ""
-echo "  Novidades v2.5:"
-echo "    - FIX PRINCIPAL: admin_cmd/root_cmd agora suprimem stderr"
-echo "      Avisos SSH nunca contaminam output capturado. Corrigido:"
-echo "        * Falso-positivo em check_existing_bundle"
-echo "          (bundle 'encontrado' quando era só aviso SSH)"
-echo "        * Falso-positivo em check_bundle_log"
-echo "          ('warn' no aviso SSH disparava alerta ATENÇÃO)"
-echo "    - admin_cmd_tty/root_cmd_tty para output ao vivo no terminal"
-echo "      (enable/disable_root_ssh, request_support_bundle)"
-echo "    - grep de check_bundle_log ajustado: 'warn' removido"
+echo "  Novidades v2.6:"
+echo "    - FIX: Fase 2 exibe última linha de /var/log/support_bundle.log"
+echo "      junto ao WARN quando o node ainda está pendente"
+echo "      Exemplo: [WARN] 10.x.x.x: ainda pendente... | last log: Compressing..."
 echo ""
-echo "  Novidades v2.4:"
-echo "    - known_hosts persistente + credênciais em /dev/shm"
+echo "  Novidades v2.5:"
+echo "    - admin_cmd/root_cmd suprimem stderr (sem contaminação por avisos SSH)"
+echo "    - admin_cmd_tty/root_cmd_tty para output ao vivo no terminal"
 echo ""
 echo "Próximos passos:"
 echo "  1. Edite o arquivo de IPs:"
