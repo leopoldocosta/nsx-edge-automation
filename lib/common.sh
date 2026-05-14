@@ -91,12 +91,14 @@ load_ips(){
 # Collected ONCE and reused for all nodes.
 # ---------------------------------------------------------------------------
 ask_admin_creds(){
+  # Skip if already set (e.g. re-sourcing the lib)
   if [[ -n "${NSX_PASS:-}" ]]; then
     log "Admin credentials already loaded, skipping prompt."
     return 0
   fi
   read -rp  "Admin username [admin]: " NSX_USER
   NSX_USER="${NSX_USER:-admin}"
+  # IFS= read -r preserves every character including backslashes and special chars
   IFS= read -rsp "Admin password (all special characters accepted): " NSX_PASS; echo
   export NSX_USER NSX_PASS
   log "Credentials collected for user '${NSX_USER}'. Will be reused for all nodes."
@@ -119,13 +121,17 @@ clear_creds(){
 
 # ---------------------------------------------------------------------------
 # SSH helper: write password to a private temp file, pass via SSHPASS env var.
+# This avoids exposing the password in process args and handles any char safely.
 # ---------------------------------------------------------------------------
 _sshpass_safe(){
+  # $1 = password variable name (NSX_PASS or ROOT_PASS)
+  # remaining args = ssh command
   local _passvar="$1"; shift
   local _pass="${!_passvar}"
   local _tmpfile
   _tmpfile="$(mktemp -t sshpass_XXXXXX)"
   chmod 600 "${_tmpfile}"
+  # Write raw password to file — no shell interpretation
   printf '%s' "${_pass}" > "${_tmpfile}"
   SSHPASS="$(cat "${_tmpfile}")" sshpass -e "$@"
   local _rc=$?
@@ -177,101 +183,59 @@ root_cmd(){  local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>&1; }
 
 # ---------------------------------------------------------------------------
 # Root SSH Control
-# Comandos corretos NSX Edge CLI:
-#   Habilitar : set ssh root-login   + get service ssh  (validacao)
-#   Desabilitar: clear ssh root-login + get service ssh  (validacao)
 # ---------------------------------------------------------------------------
 enable_root_ssh(){
   local ip="$1"
   log "${ip}: enabling root SSH..."
-  admin_cmd "$ip" 'set ssh root-login' || true
-  admin_cmd "$ip" 'get service ssh'    || true
+  admin_cmd "$ip" 'set service ssh enabled; start service ssh; set service ssh root-login enabled' || true
 }
 
 disable_root_ssh(){
   local ip="$1"
   log "${ip}: disabling root SSH..."
-  admin_cmd "$ip" 'clear ssh root-login' || true
-  admin_cmd "$ip" 'get service ssh'      || true
+  admin_cmd "$ip" 'set service ssh root-login disabled' || true
 }
 
 # ---------------------------------------------------------------------------
 # Support Bundle helpers
-#
-# request_support_bundle:
-#   Comando correto NSX Edge CLI (admin):
-#     get support-bundle file <filename> log-age 1
-#   Usa log-age 1 (1 dia). Sem o parametro 'all'.
-#   Nome do arquivo inclui IP e timestamp para identificacao.
-#
-# check_support_bundle:
-#   Via admin : get files  -- lista arquivos gerados no node
-#   Via root  : tail -30 /var/log/support_bundle  -- status de geracao
 # ---------------------------------------------------------------------------
 request_support_bundle(){
   local ip="$1"
-  local fname
-  fname="support-bundle-${ip//\./-}-$(date +%Y%m%d_%H%M%S).tgz"
-  log "${ip}: requesting support bundle (log-age 1 day) -> ${fname}"
-  admin_cmd "$ip" "get support-bundle file ${fname} log-age 1" || true
+  local fname="nsx_sb_${ip}.tgz"
+  log "${ip}: disparando support bundle em background (fire-and-forget)..."
+  # O comando é disparado via SSH e desacoplado imediatamente (&).
+  # Não aguardamos retorno — o NSX continua gerando internamente.
+  # Progresso monitorado via root em /var/log/support_bundle (PHASE 2).
+  if [[ -f "${ADMIN_KEY}" ]]; then
+    ssh -i "${ADMIN_KEY}" \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=15 \
+        -o BatchMode=yes \
+        -o ServerAliveInterval=0 \
+        "admin@${ip}" \
+        "get support-bundle file ${fname} log-age 1" \
+        </dev/null >/dev/null 2>&1 &
+  else
+    SSHPASS="${NSX_PASS}" sshpass -e \
+        ssh -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=15 \
+            -o ServerAliveInterval=0 \
+            "${NSX_USER}@${ip}" \
+            "get support-bundle file ${fname} log-age 1" \
+            </dev/null >/dev/null 2>&1 &
+  fi
+  log "${ip}: SSH disparado em background (PID $!). Verificacao sera feita via root em /var/log/support_bundle."
 }
 
 check_support_bundle(){
   local ip="$1"
-  local out_files out_log
-
-  # Via admin: lista arquivos presentes no node
-  out_files="$(admin_cmd "$ip" 'get files' || echo 'ADMIN_CMD_FAILED')"
-
-  # Via root: verifica log de geracao do support bundle
+  local out_log out_files out_root
   out_log="$(root_cmd "$ip" \
-    'if [ -f /var/log/support_bundle ]; then
-       echo "=== /var/log/support_bundle (ultimas 30 linhas) ===";
-       tail -30 /var/log/support_bundle;
-     else
-       echo "FILE_NOT_FOUND: /var/log/support_bundle nao existe";
-     fi' \
-    || echo 'ROOT_CMD_FAILED')"
-
-  printf '=== %s: get files ===\n%s\n\n=== %s: /var/log/support_bundle ===\n%s\n' \
-    "$ip" "$out_files" "$ip" "$out_log"
-}
-
-# ---------------------------------------------------------------------------
-# print_final_report  <status_csv>
-# Le o CSV gerado pelo nsx_sb_main.sh e imprime visao consolidada por no.
-# ---------------------------------------------------------------------------
-print_final_report(){
-  local csv="$1"
-  local sep
-  sep=$(printf '%0.s-' {1..72})
-
-  echo ""
-  echo "${sep}"
-  echo "  RELATORIO CONSOLIDADO - NSX EDGE SUPPORT BUNDLES"
-  echo "${sep}"
-  printf '%-18s %-14s %-12s %-22s %s\n' "NODE IP" "FASE" "STATUS" "TIMESTAMP" "DETALHES"
-  echo "${sep}"
-
-  tail -n +2 "$csv" | awk -F',' '{
-    printf "%-18s %-14s %-12s %-22s %s\n", $1, $2, $3, $5, $4
-  }'
-
-  echo "${sep}"
-  echo ""
-  echo "=== RESULTADO FINAL DOS BUNDLES POR NO ==="
-  echo "${sep}"
-  printf '%-18s %-12s %s\n' "NODE IP" "RESULTADO" "DETALHES"
-  echo "${sep}"
-
-  tail -n +2 "$csv" | awk -F',' '
-    $2=="phase2" { last[$1]=$3" | "$4" | "$5 }
-    END {
-      for (ip in last)
-        printf "%-18s %-12s %s\n", ip, (last[ip] ~ /success/ ? "SUCCESS" : (last[ip] ~ /error/ ? "ERROR" : "PENDING")), last[ip]
-    }
-  ' | sort
-
-  echo "${sep}"
-  echo ""
+    "test -f /var/log/support_bundle && tail -50 /var/log/support_bundle || echo FILE_NOT_FOUND")"
+  out_files="$(root_cmd "$ip" \
+    "find /var/log /storage /tmp -maxdepth 3 \( -name '*support*bundle*' -o -name '*.tgz' -o -name '*.tar.gz' \) -type f 2>/dev/null | head -20")"
+  out_root="$(root_cmd "$ip" "getent passwd root >/dev/null 2>&1; echo ROOT_OK")"
+  printf '%s\n----FILES----\n%s\n----ROOT----\n%s\n' "$out_log" "$out_files" "$out_root"
 }
