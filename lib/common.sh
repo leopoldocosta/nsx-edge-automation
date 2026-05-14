@@ -7,11 +7,13 @@
 #
 # Credential persistence: when user chooses NOT to clear credentials,
 # they are saved to a tmpfs session file (/dev/shm or /tmp) with mode 600.
-# The file is removed by clear_creds or when the session is explicitly cleared.
 #
-# Known hosts: uses a persistent per-UID file in /tmp so the
-# "Permanently added ... to known hosts" warning is suppressed on
-# subsequent connections to the same IPs.
+# Known hosts: persistent per-UID file in /tmp — "Permanently added"
+# warning appears only on first connection to each IP.
+#
+# stderr isolation: admin_cmd/root_cmd suppress stderr so SSH warnings
+# ("Warning: Permanently added ...") never contaminate captured stdout.
+# This prevents false-positive bundle detection and spurious WARN alerts.
 #
 # Usage in any automation script:
 #   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -141,23 +143,18 @@ _remove_cred_file(){
 
 # ---------------------------------------------------------------------------
 # Credentials
-# Collected interactively ONCE per session and reused for all nodes.
-# Passwords stored in memory only (session file in /dev/shm, never on disk).
 # ---------------------------------------------------------------------------
 ask_admin_creds(){
-  # 1. Already in environment (same process tree)
   if [[ -n "${NSX_PASS:-}" ]]; then
     log "Admin credentials already in environment (user: '${NSX_USER:-admin}'). Skipping prompt."
     return 0
   fi
-  # 2. Try session file (set by a previous script run)
   if _load_creds 2>/dev/null; then
     if [[ -n "${NSX_PASS:-}" ]]; then
       log "Admin credentials loaded from session file (user: '${NSX_USER:-admin}'). Skipping prompt."
       return 0
     fi
   fi
-  # 3. Interactive prompt
   read -rp  "Usuário admin [admin]: " NSX_USER
   NSX_USER="${NSX_USER:-admin}"
   IFS= read -rsp "Senha admin (todos os caracteres especiais aceitos): " NSX_PASS; echo
@@ -166,19 +163,16 @@ ask_admin_creds(){
 }
 
 ask_root_creds(){
-  # 1. Already in environment
   if [[ -n "${ROOT_PASS:-}" ]]; then
     log "Root credentials already in environment. Skipping prompt."
     return 0
   fi
-  # 2. Try session file
   if _load_creds 2>/dev/null; then
     if [[ -n "${ROOT_PASS:-}" ]]; then
       log "Root credentials loaded from session file. Skipping prompt."
       return 0
     fi
   fi
-  # 3. Interactive prompt
   IFS= read -rsp "Senha root (todos os caracteres especiais aceitos): " ROOT_PASS; echo
   export ROOT_PASS
   log "Root credentials collected. Will be reused for all nodes."
@@ -204,9 +198,11 @@ prompt_clear_creds(){
 
 # ---------------------------------------------------------------------------
 # SSH Functions — always password-based via sshpass
-# _KNOWN_HOSTS is a persistent per-UID file so "Permanently added" warnings
-# only appear the very first time each IP is seen. Subsequent calls are silent.
-# StrictHostKeyChecking=accept-new: auto-accept unknown hosts, never re-prompt.
+#
+# ssh_admin / ssh_root: raw SSH, stderr goes to terminal (interactive use).
+# admin_cmd / root_cmd: capture stdout only; stderr suppressed.
+#   This prevents SSH warnings ("Warning: Permanently added ...") from
+#   contaminating captured output used for bundle detection / log parsing.
 # ---------------------------------------------------------------------------
 ssh_admin(){
   local ip="$1"; shift
@@ -234,28 +230,138 @@ ssh_root(){
   return $_rc
 }
 
-admin_cmd(){ local ip="$1" cmd="$2"; ssh_admin "$ip" "$cmd" 2>&1; }
-root_cmd(){  local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>&1; }
+# admin_cmd / root_cmd: stdout only, stderr suppressed
+# Use these for all programmatic output capture.
+admin_cmd(){ local ip="$1" cmd="$2"; ssh_admin "$ip" "$cmd" 2>/dev/null; }
+root_cmd(){  local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>/dev/null; }
+
+# admin_cmd_tty / root_cmd_tty: stdout + stderr to terminal
+# Use these when showing live output to the user (enable/disable root SSH logs).
+admin_cmd_tty(){ local ip="$1" cmd="$2"; ssh_admin "$ip" "$cmd" 2>&1; }
+root_cmd_tty(){  local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>&1; }
 
 # ---------------------------------------------------------------------------
 # Root SSH Control
+# Uses *_tty variants so the operator sees live SSH output on the terminal.
 # ---------------------------------------------------------------------------
 enable_root_ssh(){
   local ip="$1"
   log "${ip}: enabling root SSH..."
   log "${ip}: >> set ssh root-login"
-  admin_cmd "$ip" 'set ssh root-login' || true
+  admin_cmd_tty "$ip" 'set ssh root-login' || true
   log "${ip}: >> get service ssh"
-  admin_cmd "$ip" 'get service ssh' || true
+  admin_cmd_tty "$ip" 'get service ssh' || true
 }
 
 disable_root_ssh(){
   local ip="$1"
   log "${ip}: disabling root SSH..."
   log "${ip}: >> clear ssh root-login"
-  admin_cmd "$ip" 'clear ssh root-login' || true
+  admin_cmd_tty "$ip" 'clear ssh root-login' || true
   log "${ip}: >> get service ssh"
-  admin_cmd "$ip" 'get service ssh' || true
+  admin_cmd_tty "$ip" 'get service ssh' || true
+}
+
+# ---------------------------------------------------------------------------
+# check_bundle_log IP
+#   Reads /var/log/support_bundle.log on the node (last 10 lines).
+#   Uses root_cmd (stderr suppressed) so SSH warnings never appear in output.
+#   Returns: 0=ok, 1=errors/warnings found in log, 2=file not found
+# ---------------------------------------------------------------------------
+check_bundle_log(){
+  local ip="$1"
+  local log_file="/var/log/support_bundle.log"
+  local out
+
+  log "${ip}: lendo ${log_file} (últimas 10 linhas)..."
+  out="$(root_cmd "$ip" "test -f ${log_file} && tail -10 ${log_file} || echo '__FILE_NOT_FOUND__'")"
+
+  if grep -q '__FILE_NOT_FOUND__' <<< "$out"; then
+    log_warn "${ip}: ${log_file} não encontrado — geração anterior pode não ter ocorrido."
+    return 2
+  fi
+
+  echo ""
+  echo "  ┌─ ${ip}: ${log_file} (últimas 10 linhas) ─────────────────────"
+  while IFS= read -r line; do
+    echo "  │  ${line}"
+  done <<< "$out"
+  echo "  └────────────────────────────────────────────────────────────────"
+  echo ""
+
+  if grep -qiE 'error|fail|exception|abort|fatal' <<< "$out"; then
+    log_warn "${ip}: ATENÇÃO — problemas detectados no log da geração anterior (ver acima)."
+    return 1
+  fi
+
+  log_ok "${ip}: log da geração anterior sem erros aparentes."
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# check_existing_bundle IP
+#   Detects existing support bundles on the node.
+#   Uses admin_cmd/root_cmd (stderr suppressed) so SSH warnings never
+#   appear in found_files, preventing false-positive bundle detection.
+#   Returns 0 with filenames on stdout if found, 1 otherwise.
+# ---------------------------------------------------------------------------
+check_existing_bundle(){
+  local ip="$1"
+  local found_files=""
+
+  # Strategy 1: admin 'get files'
+  local admin_out
+  admin_out="$(admin_cmd "$ip" 'get files' || true)"
+  if [[ -n "$admin_out" ]]; then
+    local admin_matches
+    admin_matches="$(grep -iE 'support-bundle' <<< "$admin_out" || true)"
+    [[ -n "$admin_matches" ]] && found_files="$admin_matches"
+  fi
+
+  # Strategy 2: root ls on file-store
+  if [[ -z "$found_files" ]]; then
+    local root_out
+    root_out="$(root_cmd "$ip" \
+      'ls /var/vmware/nsx/file-store/support-bundle* 2>/dev/null || true' || true)"
+    if [[ -n "$root_out" ]] && ! grep -qiE 'no such file|cannot access' <<< "$root_out"; then
+      found_files="$root_out"
+    fi
+  fi
+
+  if [[ -n "$found_files" ]]; then
+    echo "$found_files"
+    return 0
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# prompt_new_bundle IP FILES
+# ---------------------------------------------------------------------------
+prompt_new_bundle(){
+  local ip="$1"
+  local files="$2"
+  local reply
+
+  echo ""
+  echo "  *** Support bundle já existe em ${ip} ***"
+  echo "  Arquivos encontrados:"
+  while IFS= read -r f; do
+    echo "    ${f}"
+  done <<< "$files"
+  echo ""
+
+  if read -r -t 10 -p "  Gerar um NOVO support bundle para ${ip}? [s/N] (skip automático em 10s): " reply </dev/tty; then
+    echo ""
+    case "${reply,,}" in
+      s|y|sim|yes) return 0 ;;
+      *) log "${ip}: Geração de novo bundle cancelada pelo usuário."; return 1 ;;
+    esac
+  else
+    echo ""
+    log "${ip}: Sem resposta em 10 segundos — pulando geração de bundle."
+    return 1
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -265,14 +371,14 @@ request_support_bundle(){
   local ip="$1"
   local fname="sb_${ip//./_}_$(date +%Y%m%d_%H%M%S).tgz"
   log "${ip}: >> get support-bundle file ${fname} log-age 1"
-  admin_cmd "$ip" "get support-bundle file ${fname} log-age 1" || true
+  admin_cmd_tty "$ip" "get support-bundle file ${fname} log-age 1" || true
 }
 
 check_support_bundle(){
   local ip="$1"
   local out_log out_files out_root
   out_log="$(root_cmd "$ip" \
-    "test -f /var/log/support_bundle && tail -50 /var/log/support_bundle || echo FILE_NOT_FOUND")"
+    "test -f /var/log/support_bundle.log && tail -50 /var/log/support_bundle.log || echo FILE_NOT_FOUND")"
   out_files="$(root_cmd "$ip" \
     "find /var/log /storage /tmp -maxdepth 3 \( -name '*support*bundle*' -o -name '*.tgz' -o -name '*.tar.gz' \) -type f 2>/dev/null | head -20")"
   out_root="$(root_cmd "$ip" "getent passwd root >/dev/null 2>&1; echo ROOT_OK")"

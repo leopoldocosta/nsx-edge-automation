@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v2.4
+# deploy_nsx_sb_check.sh  v2.5
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
 # USO:
 #   bash deploy_nsx_sb_check.sh [--dir /caminho/destino]
+#   curl -fsSL https://raw.githubusercontent.com/leopoldocosta/nsx-edge-automation/main/automations/support_bundle/deploy_nsx_sb_check.sh | bash
 #
 # O script gera todos os arquivos localmente e solicita os IPs dos Edge Nodes.
 # Nenhum repositório Git é necessário.
@@ -34,7 +35,7 @@ mkdir -p \
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v2.4"
+echo "  NSX Edge Automation — Support Bundle Kit  v2.5"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -75,23 +76,33 @@ session.env
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh  — v2.4
-# FIX: credential persistence via tmpfs session file (/dev/shm)
-# FIX: persistent known_hosts per UID — elimina aviso "Permanently added"
+# lib/common.sh  — v2.5
+# FIX: stderr isolated from stdout in admin_cmd/root_cmd
+#      SSH warnings never contaminate captured output
+# FIX: credential persistence via /dev/shm session file
+# FIX: persistent known_hosts per UID
+# FIX: check_bundle_log no longer false-triggers on 'warn' SSH lines
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh  — v2.4
+# lib/common.sh  — v2.5
 # Biblioteca compartilhada para todos os scripts NSX Edge Automation.
 # Autenticação: sempre sshpass (senha). Sem chaves SSH.
 #
+# FIX v2.5:
+#   - admin_cmd/root_cmd: stderr suprimido (2>/dev/null)
+#     Avisos SSH ("Warning: Permanently added") nunca contaminam o stdout
+#     capturado, eliminando:
+#       * Falso-positivo em check_existing_bundle (bundle detectado
+#         quando só havia o aviso SSH na saída)
+#       * Falso-positivo em check_bundle_log ("warn" no aviso SSH
+#         disparava alerta ATENÇÃO mesmo com log NSX limpo)
+#   - admin_cmd_tty/root_cmd_tty: stdout+stderr no terminal
+#     Usado em enable/disable_root_ssh e request_support_bundle
+#     para que o operador veja a saída ao vivo
 # FIX v2.4:
-#   - Credenciais persistidas em /dev/shm/.nsx_session_<UID> (tmpfs, chmod 600)
-#     quando usuário responde "n" ao prompt de limpeza.
-#     Scripts subsequentes carregam automaticamente sem novo prompt.
-#   - known_hosts persistente em /tmp/.nsx_known_hosts_<UID> (chmod 600).
-#     Aviso "Permanently added" ocorre apenas na PRIMEIRA conexão a cada IP.
-#     Conexões subsequentes são silenciosas.
+#   - Credenciais persistidas em /dev/shm/.nsx_session_<UID> (tmpfs)
+#   - known_hosts persistente em /tmp/.nsx_known_hosts_<UID>
 set -euo pipefail
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -109,7 +120,7 @@ _CRED_DIR="/tmp"
 [[ -d "/dev/shm" ]] && _CRED_DIR="/dev/shm"
 _CRED_FILE="${_CRED_DIR}/.nsx_session_${UID}"
 
-# Persistent known_hosts per UID — suprime aviso "Permanently added"
+# Persistent known_hosts per UID
 _KNOWN_HOSTS="/tmp/.nsx_known_hosts_${UID}"
 touch "${_KNOWN_HOSTS}" 2>/dev/null && chmod 600 "${_KNOWN_HOSTS}" 2>/dev/null || true
 
@@ -171,7 +182,7 @@ load_ips(){
 }
 
 # ---------------------------------------------------------------------------
-# Session file helpers — tmpfs only (memória, nunca disco)
+# Session file helpers
 # ---------------------------------------------------------------------------
 _save_creds(){
   (
@@ -209,22 +220,19 @@ _remove_cred_file(){
 }
 
 # ---------------------------------------------------------------------------
-# Credenciais — coletadas interativamente UMA VEZ e reutilizadas
+# Credenciais
 # ---------------------------------------------------------------------------
 ask_admin_creds(){
-  # 1. Já no ambiente (mesma árvore de processo)
   if [[ -n "${NSX_PASS:-}" ]]; then
     log "Credenciais admin já no ambiente (usuário: '${NSX_USER:-admin}'). Pulando prompt."
     return 0
   fi
-  # 2. Tenta arquivo de sessão (gravado por script anterior)
   if _load_creds 2>/dev/null; then
     if [[ -n "${NSX_PASS:-}" ]]; then
       log "Credenciais admin carregadas do arquivo de sessão (usuário: '${NSX_USER:-admin}'). Pulando prompt."
       return 0
     fi
   fi
-  # 3. Prompt interativo
   read -rp  "Usuário admin [admin]: " NSX_USER
   NSX_USER="${NSX_USER:-admin}"
   IFS= read -rsp "Senha admin (todos os caracteres especiais aceitos): " NSX_PASS; echo
@@ -233,19 +241,16 @@ ask_admin_creds(){
 }
 
 ask_root_creds(){
-  # 1. Já no ambiente
   if [[ -n "${ROOT_PASS:-}" ]]; then
     log "Credenciais root já no ambiente. Pulando prompt."
     return 0
   fi
-  # 2. Tenta arquivo de sessão
   if _load_creds 2>/dev/null; then
     if [[ -n "${ROOT_PASS:-}" ]]; then
       log "Credenciais root carregadas do arquivo de sessão. Pulando prompt."
       return 0
     fi
   fi
-  # 3. Prompt interativo
   IFS= read -rsp "Senha root (todos os caracteres especiais aceitos): " ROOT_PASS; echo
   export ROOT_PASS
   log "Credenciais root coletadas. Serão reutilizadas em todos os nodes."
@@ -271,8 +276,13 @@ prompt_clear_creds(){
 
 # ---------------------------------------------------------------------------
 # SSH — sempre via sshpass (senha). Sem chaves SSH.
-# StrictHostKeyChecking=accept-new: aceita automaticamente hosts novos,
-# reutiliza entradas existentes — sem aviso "Permanently added" repetido.
+#
+# ssh_admin / ssh_root  : SSH bruto, stderr vai ao terminal (uso interativo)
+# admin_cmd / root_cmd  : captura apenas stdout; stderr suprimido (2>/dev/null)
+#   Usado em check_existing_bundle, check_bundle_log, check_support_bundle:
+#   avisos SSH nunca contaminam o output capturado.
+# admin_cmd_tty / root_cmd_tty : stdout+stderr no terminal
+#   Usado em enable/disable_root_ssh e request_support_bundle.
 # ---------------------------------------------------------------------------
 ssh_admin(){
   local ip="$1"; shift
@@ -300,28 +310,30 @@ ssh_root(){
   return $_rc
 }
 
-admin_cmd(){ local ip="$1" cmd="$2"; ssh_admin "$ip" "$cmd" 2>&1; }
-root_cmd(){  local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>&1; }
+admin_cmd(){     local ip="$1" cmd="$2"; ssh_admin "$ip" "$cmd" 2>/dev/null; }
+root_cmd(){      local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>/dev/null; }
+admin_cmd_tty(){ local ip="$1" cmd="$2"; ssh_admin "$ip" "$cmd" 2>&1; }
+root_cmd_tty(){  local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>&1; }
 
 # ---------------------------------------------------------------------------
-# Root SSH Control
+# Root SSH Control — usa *_tty para output ao vivo no terminal
 # ---------------------------------------------------------------------------
 enable_root_ssh(){
   local ip="$1"
   log "${ip}: habilitando root SSH..."
   log "${ip}: >> set ssh root-login"
-  admin_cmd "$ip" 'set ssh root-login' || true
+  admin_cmd_tty "$ip" 'set ssh root-login' || true
   log "${ip}: >> get service ssh"
-  admin_cmd "$ip" 'get service ssh' || true
+  admin_cmd_tty "$ip" 'get service ssh' || true
 }
 
 disable_root_ssh(){
   local ip="$1"
   log "${ip}: desabilitando root SSH..."
   log "${ip}: >> clear ssh root-login"
-  admin_cmd "$ip" 'clear ssh root-login' || true
+  admin_cmd_tty "$ip" 'clear ssh root-login' || true
   log "${ip}: >> get service ssh"
-  admin_cmd "$ip" 'get service ssh' || true
+  admin_cmd_tty "$ip" 'get service ssh' || true
 }
 
 # ---------------------------------------------------------------------------
@@ -333,7 +345,7 @@ check_bundle_log(){
   local out
 
   log "${ip}: lendo ${log_file} (últimas 10 linhas)..."
-  out="$(root_cmd "$ip" "test -f ${log_file} && tail -10 ${log_file} || echo '__FILE_NOT_FOUND__'" 2>/dev/null || true)"
+  out="$(root_cmd "$ip" "test -f ${log_file} && tail -10 ${log_file} || echo '__FILE_NOT_FOUND__'")"
 
   if grep -q '__FILE_NOT_FOUND__' <<< "$out"; then
     log_warn "${ip}: ${log_file} não encontrado — geração anterior pode não ter ocorrido."
@@ -348,7 +360,8 @@ check_bundle_log(){
   echo "  └────────────────────────────────────────────────────────────────"
   echo ""
 
-  if grep -qiE 'error|fail|exception|abort|fatal|warn' <<< "$out"; then
+  # grep apenas por erros reais do NSX; 'warn' removido para não capturar linhas SSH
+  if grep -qiE 'error|fail|exception|abort|fatal' <<< "$out"; then
     log_warn "${ip}: ATENÇÃO — problemas detectados no log da geração anterior (ver acima)."
     return 1
   fi
@@ -365,7 +378,7 @@ check_existing_bundle(){
   local found_files=""
 
   local admin_out
-  admin_out="$(admin_cmd "$ip" 'get files' 2>/dev/null || true)"
+  admin_out="$(admin_cmd "$ip" 'get files' || true)"
   if [[ -n "$admin_out" ]]; then
     local admin_matches
     admin_matches="$(grep -iE 'support-bundle' <<< "$admin_out" || true)"
@@ -375,7 +388,7 @@ check_existing_bundle(){
   if [[ -z "$found_files" ]]; then
     local root_out
     root_out="$(root_cmd "$ip" \
-      'ls /var/vmware/nsx/file-store/support-bundle* 2>/dev/null || true' 2>/dev/null || true)"
+      'ls /var/vmware/nsx/file-store/support-bundle* 2>/dev/null || true' || true)"
     if [[ -n "$root_out" ]] && ! grep -qiE 'no such file|cannot access' <<< "$root_out"; then
       found_files="$root_out"
     fi
@@ -424,7 +437,7 @@ request_support_bundle(){
   local ip="$1"
   local fname="sb_${ip//./_}_$(date +%Y%m%d_%H%M%S).tgz"
   log "${ip}: >> get support-bundle file ${fname} log-age 1"
-  admin_cmd "$ip" "get support-bundle file ${fname} log-age 1" || true
+  admin_cmd_tty "$ip" "get support-bundle file ${fname} log-age 1" || true
 }
 
 check_support_bundle(){
@@ -520,29 +533,29 @@ for ip in "${EDGE_IPS[@]}"; do
     ping -c 1 -W 2 "$ip" 2>&1 || echo "WARN: ping falhou (pode estar filtrado)"
 
     echo "--- [2] admin: get version ---"
-    admin_cmd "$ip" 'get version' || echo "FAIL"
+    admin_cmd_tty "$ip" 'get version' || echo "FAIL"
 
     echo "--- [3] admin: get service ssh ---"
-    admin_cmd "$ip" 'get service ssh' || echo "FAIL"
+    admin_cmd_tty "$ip" 'get service ssh' || echo "FAIL"
 
     echo "--- [4] admin: get managers ---"
-    admin_cmd "$ip" 'get managers' || echo "FAIL"
+    admin_cmd_tty "$ip" 'get managers' || echo "FAIL"
 
     echo "--- [5] enable root SSH ---"
     enable_root_ssh "$ip"
     sleep 2
 
     echo "--- [6] root: uname -a ---"
-    root_cmd "$ip" 'uname -a' || echo "FAIL"
+    root_cmd_tty "$ip" 'uname -a' || echo "FAIL"
 
     echo "--- [7] root: uptime ---"
-    root_cmd "$ip" 'uptime' || echo "FAIL"
+    root_cmd_tty "$ip" 'uptime' || echo "FAIL"
 
     echo "--- [8] root: df -h /var/log ---"
-    root_cmd "$ip" 'df -h /var/log' || echo "FAIL"
+    root_cmd_tty "$ip" 'df -h /var/log' || echo "FAIL"
 
     echo "--- [9] presença do log support_bundle.log ---"
-    root_cmd "$ip" 'ls -lh /var/log/support_bundle.log 2>/dev/null || echo FILE_NOT_FOUND'
+    root_cmd_tty "$ip" 'ls -lh /var/log/support_bundle.log 2>/dev/null || echo FILE_NOT_FOUND'
 
     echo "--- [10] disable root SSH ---"
     disable_root_ssh "$ip"
@@ -557,11 +570,11 @@ TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_main.sh  — v2.4
+# nsx_sb_main.sh  — v2.5
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v2.4
+# nsx_sb_main.sh  — v2.5
 # Orquestrador: PRE-CHECK + Fase 1 (solicitar SB) + Fase 2 (verificar a cada 5 min)
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -688,7 +701,7 @@ read -rp "Comando NSX CLI para executar em todos os nodes: " NSX_CMD
 
 for ip in "${EDGE_IPS[@]}"; do
   log "${ip}: >> ${NSX_CMD}"
-  admin_cmd "$ip" "${NSX_CMD}" || log_warn "${ip}: comando retornou erro"
+  admin_cmd_tty "$ip" "${NSX_CMD}" || log_warn "${ip}: comando retornou erro"
 done
 
 prompt_clear_creds
@@ -721,7 +734,7 @@ for ip in "${EDGE_IPS[@]}"; do
   sleep 1
 
   log "${ip}: >> ${SHELL_CMD}"
-  root_cmd "$ip" "${SHELL_CMD}" || log_warn "${ip}: comando retornou erro"
+  root_cmd_tty "$ip" "${SHELL_CMD}" || log_warn "${ip}: comando retornou erro"
 
   log "${ip}: desabilitando root SSH..."
   disable_root_ssh "$ip"
@@ -831,14 +844,12 @@ Todos os scripts pedem usuário e senha interativamente na primeira execução.
 Quando o usuário responde "n" ao prompt de limpeza, as credenciais são salvas
 em `/dev/shm/.nsx_session_<UID>` (tmpfs, chmod 600) e recarregadas
 automaticamente pelo próximo script — sem novo prompt.
-Nunca são escritas em disco permanente.
 
 ## Known Hosts
 
 Um arquivo `/tmp/.nsx_known_hosts_<UID>` (chmod 600) é mantido entre execuções.
 O aviso "Permanently added" aparece apenas na **primeira** conexão a cada IP.
 Conexões subsequentes são silenciosas.
-O arquivo é removido automaticamente ao responder "S" (limpar credenciais).
 MANUALDOC
 
 # ---------------------------------------------------------------------------
@@ -867,20 +878,22 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "================================================================"
-echo "  Deploy concluído! v2.4"
+echo "  Deploy concluído! v2.5"
 echo "================================================================"
 echo ""
-echo "  Novidades v2.4:"
-echo "    - FIX: known_hosts persistente por UID em /tmp/.nsx_known_hosts_<UID>"
-echo "      Aviso 'Permanently added' ocorre só na 1ª conexão a cada IP."
-echo "      StrictHostKeyChecking=accept-new substitui 'no' — mais seguro."
-echo "    - FIX: credenciais persistidas em /dev/shm/.nsx_session_<UID>"
-echo "      Scripts subsequentes carregam automaticamente sem novo prompt."
-echo "    - deploy sincronizado com todas as correções do lib/common.sh"
+echo "  Novidades v2.5:"
+echo "    - FIX PRINCIPAL: admin_cmd/root_cmd agora suprimem stderr"
+echo "      Avisos SSH nunca contaminam output capturado. Corrigido:"
+echo "        * Falso-positivo em check_existing_bundle"
+echo "          (bundle 'encontrado' quando era só aviso SSH)"
+echo "        * Falso-positivo em check_bundle_log"
+echo "          ('warn' no aviso SSH disparava alerta ATENÇÃO)"
+echo "    - admin_cmd_tty/root_cmd_tty para output ao vivo no terminal"
+echo "      (enable/disable_root_ssh, request_support_bundle)"
+echo "    - grep de check_bundle_log ajustado: 'warn' removido"
 echo ""
-echo "  Novidades v2.3:"
-echo "    - BUG FIX: check_support_bundle() path corrigido (.log)"
-echo "    - BUG FIX: test_connections.sh passo [9] corrigido"
+echo "  Novidades v2.4:"
+echo "    - known_hosts persistente + credênciais em /dev/shm"
 echo ""
 echo "Próximos passos:"
 echo "  1. Edite o arquivo de IPs:"
