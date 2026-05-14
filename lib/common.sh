@@ -86,7 +86,7 @@ load_ips(){
 # ---------------------------------------------------------------------------
 # Credentials
 # Collected ONCE and reused for all nodes.
-# ask_admin_creds / ask_root_creds are no-ops if variables already exist.
+# ask_admin_creds / ask_root_creds sao no-op se variaveis ja existirem.
 # ---------------------------------------------------------------------------
 ask_admin_creds(){
   if [[ -n "${NSX_PASS:-}" ]]; then
@@ -121,11 +121,9 @@ clear_creds(){
 # Pergunta ao final de cada script se o usuario deseja limpar as credenciais
 # da memoria (NSX_PASS, ROOT_PASS, NSX_USER).
 #
-# Comportamento:
-#   - Padrao YES: pressionar apenas Enter limpa as credenciais e encerra.
-#   - Digitar N / no / nao mantem as credenciais no ambiente, permitindo
-#     executar o proximo script na mesma sessao de shell sem redigitar.
-#   - Qualquer entrada nao reconhecida aplica o padrao YES por seguranca.
+# Padrao YES: pressionar Enter limpa e encerra.
+# Digitar N/no mantem as credenciais para o proximo script na mesma sessao.
+# Qualquer entrada nao reconhecida aplica padrao YES por seguranca.
 #
 # Uso: adicione ao final de cada script de automacao:
 #   ask_clear_creds
@@ -159,8 +157,8 @@ ask_clear_creds(){
 }
 
 # ---------------------------------------------------------------------------
-# SSH helper: write password to a private temp file, pass via SSHPASS env var.
-# Avoids exposing password in process args. Handles any special character.
+# SSH helper: escreve senha em arquivo temporario privado.
+# Evita exposicao em argumentos de processo. Funciona com qualquer char especial.
 # ---------------------------------------------------------------------------
 _sshpass_safe(){
   local _passvar="$1"; shift
@@ -214,7 +212,7 @@ ssh_root(){
   fi
 }
 
-# Exibe o comando enviado no terminal (stderr) antes de executar
+# Exibe o comando no terminal antes de executar (stderr para nao poluir stdout)
 admin_cmd(){
   local ip="$1" cmd="$2"
   printf '[CMD] admin@%s >>> %s\n' "$ip" "$cmd" >&2
@@ -230,20 +228,24 @@ root_cmd(){
 # ---------------------------------------------------------------------------
 # Root SSH Control -- comandos corretos NSX-T Edge
 #
-# Habilitar root login : set ssh root-login
-# Desabilitar root login: clear ssh root-login
-# Validar estado        : get service ssh
+# HABILITAR root login : set ssh root-login
+# DESABILITAR root login: clear ssh root-login
+# VERIFICAR estado      : get service ssh
+#
+# IMPORTANTE: NAO usar 'start service ssh' nem 'set service ssh enabled'
+# O servico SSH ja esta ativo no Edge Node. Apenas o root-login precisa ser
+# habilitado/desabilitado conforme necessidade.
 # ---------------------------------------------------------------------------
 enable_root_ssh(){
   local ip="$1"
-  log "${ip}: enabling root SSH..."
+  log "${ip}: enabling root SSH login..."
   admin_cmd "$ip" 'set ssh root-login' || true
   admin_cmd "$ip" 'get service ssh'    || true
 }
 
 disable_root_ssh(){
   local ip="$1"
-  log "${ip}: disabling root SSH..."
+  log "${ip}: disabling root SSH login..."
   admin_cmd "$ip" 'clear ssh root-login' || true
   admin_cmd "$ip" 'get service ssh'       || true
 }
