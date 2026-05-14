@@ -85,8 +85,8 @@ load_ips(){
 
 # ---------------------------------------------------------------------------
 # Credentials
-# Coletadas UMA vez e reutilizadas em todos os nos.
-# ask_admin_creds e ask_root_creds sao no-op se as variaveis ja existirem.
+# Collected ONCE and reused for all nodes.
+# ask_admin_creds / ask_root_creds are no-ops if variables already exist.
 # ---------------------------------------------------------------------------
 ask_admin_creds(){
   if [[ -n "${NSX_PASS:-}" ]]; then
@@ -116,8 +116,51 @@ clear_creds(){
 }
 
 # ---------------------------------------------------------------------------
-# SSH helper: escreve senha em arquivo temporario privado.
-# Evita exposicao em argumentos de processo. Funciona com qualquer char especial.
+# ask_clear_creds
+#
+# Pergunta ao final de cada script se o usuario deseja limpar as credenciais
+# da memoria (NSX_PASS, ROOT_PASS, NSX_USER).
+#
+# Comportamento:
+#   - Padrao YES: pressionar apenas Enter limpa as credenciais e encerra.
+#   - Digitar N / no / nao mantem as credenciais no ambiente, permitindo
+#     executar o proximo script na mesma sessao de shell sem redigitar.
+#   - Qualquer entrada nao reconhecida aplica o padrao YES por seguranca.
+#
+# Uso: adicione ao final de cada script de automacao:
+#   ask_clear_creds
+# ---------------------------------------------------------------------------
+ask_clear_creds(){
+  echo ""
+  echo "============================================================"
+  printf "  Clear credentials from memory? [Y/n] (default: Yes): "
+  local _answer
+  IFS= read -r _answer
+  case "${_answer,,}" in
+    ""|y|ye|yes|sim|s)
+      clear_creds
+      log "Session ended. Credentials removed from memory."
+      ;;
+    n|no|nao)
+      log "Credentials kept in memory for this shell session."
+      echo ""
+      echo "  You can now run any other script without re-entering credentials:"
+      echo "    cd ~/nsx-edge-automation/automations/support_bundle && ./nsx_sb_main.sh"
+      echo "    cd ~/nsx-edge-automation/automations/ssh_cli        && ./nsx_ssh_cli.sh"
+      echo ""
+      ;;
+    *)
+      log_warn "Unrecognized input '${_answer}' -- defaulting to YES, clearing credentials."
+      clear_creds
+      ;;
+  esac
+  echo "============================================================"
+  echo ""
+}
+
+# ---------------------------------------------------------------------------
+# SSH helper: write password to a private temp file, pass via SSHPASS env var.
+# Avoids exposing password in process args. Handles any special character.
 # ---------------------------------------------------------------------------
 _sshpass_safe(){
   local _passvar="$1"; shift
@@ -185,14 +228,11 @@ root_cmd(){
 }
 
 # ---------------------------------------------------------------------------
-# Root SSH Control — comandos corretos NSX-T Edge
+# Root SSH Control -- comandos corretos NSX-T Edge
 #
 # Habilitar root login : set ssh root-login
 # Desabilitar root login: clear ssh root-login
 # Validar estado        : get service ssh
-#
-# Nota: "start service ssh" NAO e necessario — o servico SSH ja esta ativo
-# no Edge Node. Usar apenas "set ssh root-login" para liberar acesso root.
 # ---------------------------------------------------------------------------
 enable_root_ssh(){
   local ip="$1"
