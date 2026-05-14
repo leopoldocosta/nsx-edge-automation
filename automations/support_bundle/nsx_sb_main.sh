@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# nsx_sb_main.sh - Orchestrator: Phase 1 (request SB) + Phase 2 (verify every 5 min)
+# nsx_sb_main.sh — v2.6
+# Orchestrator: Phase 1 (request SB) + Phase 2 (verify every 5 min)
 # Recommended: run inside screen or tmux (~35 min total)
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -46,7 +47,11 @@ for ((round=1; round<=6; round++)); do
       printf '%s,phase2,success,%q,%s\n' "$ip" "$OUT" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
       NODE_DONE["$ip"]="true"
     else
-      log_warn "${ip}: still pending..."
+      # Still pending — fetch last line of support_bundle.log for live progress
+      LAST_LOG_LINE="$(root_cmd "$ip" \
+        "test -f /var/log/support_bundle.log && tail -1 /var/log/support_bundle.log || echo '(log not found)'" \
+        2>/dev/null || echo '(ssh error)')"
+      log_warn "${ip}: still pending... | last log: ${LAST_LOG_LINE}"
       printf '%s,phase2,pending,%q,%s\n' "$ip" "$OUT" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
     fi
   done
