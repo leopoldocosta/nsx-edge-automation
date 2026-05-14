@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v2.6
+# deploy_nsx_sb_check.sh  v2.7
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
 # USO:
@@ -35,7 +35,7 @@ mkdir -p \
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v2.6"
+echo "  NSX Edge Automation — Support Bundle Kit  v2.7"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -76,14 +76,22 @@ session.env
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh  — v2.6
+# lib/common.sh  — v2.7
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh  — v2.6
+# lib/common.sh  — v2.7
 # Biblioteca compartilhada para todos os scripts NSX Edge Automation.
 # Autenticação: sempre sshpass (senha). Sem chaves SSH.
 #
+# PRE-CHECK bundle detection (v2.7) — lógica 3 estágios:
+#   Stage 1: check_bundle_log_recent  — log indica bundle gerado nos últimos 7 dias
+#   Stage 2: check_existing_bundle    — busca .tgz em file-store ou via 'get files'
+#   Stage 3: check_bundle_in_progress — detecta processo ou arquivo parcial em andamento
+#
+# FIX v2.7:
+#   - PRE-CHECK 3-stage logic (log recent / file-store / in-progress)
+#   - SHA stale fix em check_existing_bundle
 # FIX v2.6:
 #   - nsx_sb_main.sh: exibe última linha de support_bundle.log no WARN pending
 # FIX v2.5:
@@ -262,7 +270,9 @@ prompt_clear_creds(){
 }
 
 # ---------------------------------------------------------------------------
-# SSH
+# SSH — sempre sshpass, sem chaves
+# admin_cmd / root_cmd: stdout apenas, stderr suprimido (uso programático)
+# admin_cmd_tty / root_cmd_tty: stdout+stderr no terminal (uso interativo)
 # ---------------------------------------------------------------------------
 ssh_admin(){
   local ip="$1"; shift
@@ -318,6 +328,8 @@ disable_root_ssh(){
 
 # ---------------------------------------------------------------------------
 # check_bundle_log IP
+#   Lê /var/log/support_bundle.log (últimas 10 linhas) e exibe ao operador.
+#   Retorna: 0=ok, 1=erros/warnings no log, 2=arquivo não encontrado
 # ---------------------------------------------------------------------------
 check_bundle_log(){
   local ip="$1"
@@ -350,7 +362,52 @@ check_bundle_log(){
 }
 
 # ---------------------------------------------------------------------------
+# check_bundle_log_recent IP
+#   Stage 1 do PRE-CHECK.
+#   Verifica se o log indica bundle gerado nos últimos 7 dias.
+#   Retorna: 0=bundle recente encontrado, 1=não encontrado, 2=log ausente
+# ---------------------------------------------------------------------------
+check_bundle_log_recent(){
+  local ip="$1"
+  local log_file="/var/log/support_bundle.log"
+
+  log "${ip}: [PRE-CHECK Stage 1] verificando geração recente em ${log_file}..."
+
+  local out
+  out="$(root_cmd "$ip" "test -f ${log_file} && tail -100 ${log_file} || echo '__FILE_NOT_FOUND__'")"
+
+  if grep -q '__FILE_NOT_FOUND__' <<< "$out"; then
+    log_warn "${ip}: ${log_file} não encontrado — avançando para Stage 2."
+    return 2
+  fi
+
+  local last_date
+  last_date="$(grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' <<< "$out" | tail -1 || true)"
+
+  if [[ -z "$last_date" ]]; then
+    log_warn "${ip}: nenhuma data encontrada no log — avançando para Stage 2."
+    return 1
+  fi
+
+  local log_epoch now_epoch cutoff_epoch
+  log_epoch="$(date -d "${last_date}" +%s 2>/dev/null || echo 0)"
+  now_epoch="$(date +%s)"
+  cutoff_epoch=$(( now_epoch - 7 * 86400 ))
+
+  if [[ "$log_epoch" -ge "$cutoff_epoch" ]]; then
+    log_ok "${ip}: log indica bundle gerado em ${last_date} (dentro dos últimos 7 dias) — considerando como existente."
+    return 0
+  else
+    log_warn "${ip}: último registro no log é de ${last_date} (mais de 7 dias) — avançando para Stage 2."
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # check_existing_bundle IP
+#   Stage 2 do PRE-CHECK.
+#   Detecta arquivos .tgz de support bundle no file-store ou via 'get files'.
+#   Retorna: 0 com nomes de arquivo em stdout se encontrado, 1 caso contrário
 # ---------------------------------------------------------------------------
 check_existing_bundle(){
   local ip="$1"
@@ -367,7 +424,7 @@ check_existing_bundle(){
   if [[ -z "$found_files" ]]; then
     local root_out
     root_out="$(root_cmd "$ip" \
-      'ls /var/vmware/nsx/file-store/support-bundle* 2>/dev/null || true' || true)"
+      'ls /var/vmware/nsx/file-store/support-bundle*.tgz 2>/dev/null || true' || true)"
     if [[ -n "$root_out" ]] && ! grep -qiE 'no such file|cannot access' <<< "$root_out"; then
       found_files="$root_out"
     fi
@@ -377,6 +434,48 @@ check_existing_bundle(){
     echo "$found_files"
     return 0
   fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# check_bundle_in_progress IP
+#   Stage 3 do PRE-CHECK.
+#   Detecta geração de bundle em andamento via processo ativo ou arquivo parcial.
+#   Retorna: 0=em andamento, 1=nenhuma geração detectada
+# ---------------------------------------------------------------------------
+check_bundle_in_progress(){
+  local ip="$1"
+  local found=0
+
+  log "${ip}: [PRE-CHECK Stage 3] verificando geração em andamento..."
+
+  local proc_out
+  proc_out="$(root_cmd "$ip" \
+    "ps aux 2>/dev/null | grep -iE 'support_bundle|support-bundle|napi.*bundle' | grep -v grep || true")"
+  if [[ -n "$proc_out" ]]; then
+    log_warn "${ip}: processo de geração de support bundle detectado em execução:"
+    while IFS= read -r pline; do
+      log_warn "${ip}:   ${pline}"
+    done <<< "$proc_out"
+    found=1
+  fi
+
+  local partial_out
+  partial_out="$(root_cmd "$ip" \
+    "find /var/vmware/nsx/file-store -maxdepth 1 -name 'support-bundle*' -newer /proc/1 -mmin -30 2>/dev/null || true")"
+  if [[ -n "$partial_out" ]]; then
+    log_warn "${ip}: arquivo de support bundle com escrita recente detectado (possível geração em andamento):"
+    while IFS= read -r fline; do
+      log_warn "${ip}:   ${fline}"
+    done <<< "$partial_out"
+    found=1
+  fi
+
+  if [[ "$found" -eq 1 ]]; then
+    return 0
+  fi
+
+  log "${ip}: nenhuma geração em andamento detectada."
   return 1
 }
 
@@ -452,18 +551,33 @@ EXAMPLE
 cat > "${AUTO_DIR}/install_dependencies.sh" <<'INST'
 #!/usr/bin/env bash
 # install_dependencies.sh - Instala sshpass e dependências necessárias.
+# NOTA: Em NSX Edge Nodes (Debian embarcado sem acesso a mirrors externos),
+#       o sshpass deve ser copiado de uma VM Debian/Ubuntu da mesma arquitetura:
+#         apt-get download sshpass
+#         dpkg -x sshpass_*.deb /tmp/sshpass_out
+#         scp /tmp/sshpass_out/usr/bin/sshpass root@<IP_EDGE>:/usr/local/bin/
+#         chmod +x /usr/local/bin/sshpass
 set -euo pipefail
-if command -v apt-get &>/dev/null; then
-  apt-get update -qq && apt-get install -y sshpass
-elif command -v yum &>/dev/null; then
-  yum install -y sshpass
-elif command -v dnf &>/dev/null; then
-  dnf install -y sshpass
-else
-  echo "[ERR] Gerenciador de pacotes não reconhecido. Instale sshpass manualmente."
-  exit 1
+if command -v sshpass &>/dev/null; then
+  echo "[OK] sshpass já instalado: $(command -v sshpass)"
+  exit 0
 fi
-echo "[OK] sshpass instalado."
+if command -v apt-get &>/dev/null; then
+  apt-get update -qq && apt-get install -y sshpass && echo "[OK] sshpass instalado." && exit 0
+fi
+if command -v yum &>/dev/null; then
+  yum install -y sshpass && echo "[OK] sshpass instalado." && exit 0
+fi
+if command -v dnf &>/dev/null; then
+  dnf install -y sshpass && echo "[OK] sshpass instalado." && exit 0
+fi
+echo "[ERR] Gerenciador de pacotes não reconhecido ou sshpass não disponível nos repos."
+echo "      Em NSX Edge Nodes, copie o binário manualmente de uma VM Debian/Ubuntu amd64:"
+echo "        apt-get download sshpass"
+echo "        dpkg -x sshpass_*.deb /tmp/sshpass_out"
+echo "        scp /tmp/sshpass_out/usr/bin/sshpass root@<IP_EDGE>:/usr/local/bin/"
+echo "        chmod +x /usr/local/bin/sshpass"
+exit 1
 INST
 chmod +x "${AUTO_DIR}/install_dependencies.sh"
 
@@ -547,13 +661,18 @@ TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_main.sh  — v2.6
-# FIX v2.6: exibe última linha de support_bundle.log no WARN pending
+# nsx_sb_main.sh  — v2.7
+# PRE-CHECK 3-stage logic
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v2.6
-# Orquestrador: PRE-CHECK + Fase 1 (solicitar SB) + Fase 2 (verificar a cada 5 min)
+# nsx_sb_main.sh  — v2.7
+# Orquestrador: PRE-CHECK (3 estágios) + Fase 1 (solicitar SB) + Fase 2 (verificar a cada 5 min)
+#
+# PRE-CHECK stages:
+#   1. check_bundle_log_recent  — se o log indica bundle gerado nos últimos 7 dias → existe
+#   2. check_existing_bundle    — busca .tgz em file-store ou via 'get files'
+#   3. check_bundle_in_progress — detecta processo ou arquivo parcial em andamento
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -569,7 +688,7 @@ RUN_LOG="${LOG_DIR}/sb_run_$(date +%Y%m%d_%H%M%S).log"
 STATUS_CSV="${LOG_DIR}/sb_status_$(date +%Y%m%d_%H%M%S).csv"
 echo 'ip,phase,status,details,timestamp' > "$STATUS_CSV"
 
-# ---- PRE-CHECK ----
+# ---- PRE-CHECK: 3-stage bundle detection ----
 log "=== PRE-CHECK: Verificando log e bundles existentes ==="
 declare -A SKIP_SB
 for ip in "${EDGE_IPS[@]}"; do
@@ -580,6 +699,7 @@ for ip in "${EDGE_IPS[@]}"; do
   log "${ip}: iniciando PRE-CHECK..."
   enable_root_ssh "$ip"
 
+  # Exibe log (informação ao operador)
   log_rc=0
   check_bundle_log "$ip" || log_rc=$?
   case "$log_rc" in
@@ -588,9 +708,33 @@ for ip in "${EDGE_IPS[@]}"; do
     2) printf '%s,precheck,bundle_log,not_found,%s\n'    "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV" ;;
   esac
 
+  # ------------------------------------------------------------------
+  # Stage 1: log recente (7 dias) → considera bundle como existente
+  # ------------------------------------------------------------------
+  recent_rc=0
+  check_bundle_log_recent "$ip" || recent_rc=$?
+
+  if [[ "$recent_rc" -eq 0 ]]; then
+    log "${ip}: [Stage 1] bundle recente detectado no log — verificando se usuário quer gerar novo."
+    printf '%s,precheck,stage1_log_recent,found,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+    existing_label="[log recente ≤ 7 dias]"
+    if ! prompt_new_bundle "$ip" "${existing_label}"; then
+      SKIP_SB["$ip"]="true"
+      printf '%s,precheck,existing_bundle,skipped_log_recent,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+    else
+      log "${ip}: usuário solicitou novo bundle — prosseguindo."
+      printf '%s,precheck,existing_bundle,new_requested,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+    fi
+    continue
+  fi
+
+  # ------------------------------------------------------------------
+  # Stage 2: buscar arquivo .tgz em file-store / 'get files'
+  # ------------------------------------------------------------------
   existing_files=""
   if existing_files="$(check_existing_bundle "$ip")"; then
-    log "${ip}: bundle(s) existente(s) encontrado(s)."
+    log "${ip}: [Stage 2] bundle(s) existente(s) encontrado(s) em file-store."
+    printf '%s,precheck,stage2_filestore,found,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
     if ! prompt_new_bundle "$ip" "$existing_files"; then
       SKIP_SB["$ip"]="true"
       printf '%s,precheck,existing_bundle,skipped,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
@@ -598,17 +742,29 @@ for ip in "${EDGE_IPS[@]}"; do
       log "${ip}: usuário solicitou novo bundle — prosseguindo."
       printf '%s,precheck,existing_bundle,new_requested,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
     fi
-  else
-    log "${ip}: nenhum bundle existente — será gerado."
-    printf '%s,precheck,existing_bundle,none,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+    continue
   fi
+
+  # ------------------------------------------------------------------
+  # Stage 3: verificar se há geração em andamento
+  # ------------------------------------------------------------------
+  if check_bundle_in_progress "$ip"; then
+    log_warn "${ip}: [Stage 3] geração de bundle já está em andamento — pulando solicitação."
+    printf '%s,precheck,stage3_in_progress,detected,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+    SKIP_SB["$ip"]="true"
+    continue
+  fi
+
+  # Nenhum bundle detectado — gerar novo
+  log "${ip}: nenhum bundle existente ou em andamento — será gerado."
+  printf '%s,precheck,existing_bundle,none,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
 done
 
 # ---- FASE 1: Solicitar Support Bundle ----
 log "=== FASE 1: Solicitação do Support Bundle ==="
 for ip in "${EDGE_IPS[@]}"; do
   if [[ "${SKIP_SB[$ip]}" == "true" ]]; then
-    log "${ip}: pulando solicitação (bundle existente mantido)."
+    log "${ip}: pulando solicitação (bundle existente ou em andamento)."
     continue
   fi
   enable_root_ssh "$ip"
@@ -640,7 +796,6 @@ for ((round=1; round<=6; round++)); do
       printf '%s,phase2,success,%q,%s\n' "$ip" "$OUT" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
       NODE_DONE["$ip"]="true"
     else
-      # Still pending — fetch last line of support_bundle.log for live progress
       LAST_LOG_LINE="$(root_cmd "$ip" \
         "test -f /var/log/support_bundle.log && tail -1 /var/log/support_bundle.log || echo '(log not found)'" \
         2>/dev/null || echo '(ssh error)')"
@@ -783,39 +938,53 @@ cat > "${DOCS_DIR}/MANUAL.md" <<'MANUALDOC'
 
 ## Pré-requisitos
 
-- `sshpass` instalado: `bash install_dependencies.sh`
+- `sshpass` instalado (ver abaixo)
 - Arquivo `edge_nodes.txt` com IPs dos Edge Nodes (um por linha)
+
+## Instalação do sshpass
+
+### Em servidores Linux normais (Ubuntu/Debian/RHEL)
+```bash
+bash install_dependencies.sh
+```
+
+### Em NSX Edge Nodes (Debian embarcado, sem acesso a mirrors externos)
+Copie o binário de uma VM Debian/Ubuntu amd64 com acesso à internet:
+```bash
+# Na VM Debian/Ubuntu:
+apt-get download sshpass
+dpkg -x sshpass_*.deb /tmp/sshpass_out
+scp /tmp/sshpass_out/usr/bin/sshpass root@<IP_EDGE>:/usr/local/bin/
+chmod +x /usr/local/bin/sshpass
+# Validar no Edge:
+sshpass -V
+```
 
 ## Fluxo de uso
 
 ### 1. Deploy (primeira vez ou após reinstalação)
-
 ```bash
 curl -fsSL https://raw.githubusercontent.com/leopoldocosta/nsx-edge-automation/main/automations/support_bundle/deploy_nsx_sb_check.sh | bash
 ```
 
 ### 2. Testar conectividade
-
 ```bash
 cd ~/nsx-edge-automation/automations/support_bundle
 ./test_connections.sh
 ```
 
 ### 3. Coletar Support Bundle
-
 ```bash
 ./nsx_sb_main.sh
 ```
 
 ### 4. Executar comando em todos os nodes
-
 ```bash
 ./admin_exec.sh   # como admin (NSX CLI)
 ./root_exec.sh    # como root (shell)
 ```
 
 ### 5. Sessão SSH interativa
-
 ```bash
 ./nsx_ssh_cli.sh
 ```
@@ -849,8 +1018,14 @@ IPEX
 # ---------------------------------------------------------------------------
 echo ""
 if ! command -v sshpass &>/dev/null; then
-  echo "[WARN] sshpass não encontrado. Execute:"
-  echo "       bash ${AUTO_DIR}/install_dependencies.sh"
+  echo "[WARN] sshpass não encontrado."
+  echo "       Em NSX Edge Nodes, copie o binário manualmente:"
+  echo "         apt-get download sshpass  (em VM Debian/Ubuntu com internet)"
+  echo "         dpkg -x sshpass_*.deb /tmp/sshpass_out"
+  echo "         scp /tmp/sshpass_out/usr/bin/sshpass root@<IP_EDGE>:/usr/local/bin/"
+  echo "         chmod +x /usr/local/bin/sshpass"
+  echo "       Ou em servidores com acesso a repos:"
+  echo "         bash ${AUTO_DIR}/install_dependencies.sh"
 else
   echo "[OK] sshpass encontrado: $(command -v sshpass)"
 fi
@@ -860,13 +1035,18 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "================================================================"
-echo "  Deploy concluído! v2.6"
+echo "  Deploy concluído! v2.7"
 echo "================================================================"
+echo ""
+echo "  Novidades v2.7:"
+echo "    - PRE-CHECK 3 estágios: log recente (7d) / file-store / in-progress"
+echo "    - Stage 1: detecta bundle recente no log (últimos 7 dias)"
+echo "    - Stage 2: detecta .tgz em file-store ou via 'get files'"
+echo "    - Stage 3: detecta geração em andamento (processo ou arquivo parcial)"
 echo ""
 echo "  Novidades v2.6:"
 echo "    - FIX: Fase 2 exibe última linha de /var/log/support_bundle.log"
 echo "      junto ao WARN quando o node ainda está pendente"
-echo "      Exemplo: [WARN] 10.x.x.x: ainda pendente... | last log: Compressing..."
 echo ""
 echo "  Novidades v2.5:"
 echo "    - admin_cmd/root_cmd suprimem stderr (sem contaminação por avisos SSH)"
