@@ -15,6 +15,14 @@
 # ("Warning: Permanently added ...") never contaminate captured stdout.
 # This prevents false-positive bundle detection and spurious WARN alerts.
 #
+# PRE-CHECK bundle detection (v2.7) — 3-stage logic:
+#   Stage 1: check_bundle_log_recent — if support_bundle.log shows a bundle
+#            generated within the last 7 days, treat as existing (return 0).
+#   Stage 2: check_existing_bundle   — look for .tgz files in file-store or
+#            via 'get files' (admin CLI).
+#   Stage 3: check_bundle_in_progress — detect an active generation process
+#            (napi/python pid running support_bundle collection).
+#
 # Usage in any automation script:
 #   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #   export AUTO_DIR="${SCRIPT_DIR}"
@@ -299,8 +307,60 @@ check_bundle_log(){
 }
 
 # ---------------------------------------------------------------------------
+# check_bundle_log_recent IP
+#   Stage 1 of PRE-CHECK.
+#   Scans /var/log/support_bundle.log for a timestamp indicating that a
+#   support bundle was successfully generated within the last 7 days.
+#   Looks for lines containing date patterns (YYYY-MM-DD) in the last 100
+#   lines and compares to the current epoch minus 7 days.
+#   Returns:
+#     0 — recent bundle found in log (within 7 days)  → treat as existing
+#     1 — no recent bundle timestamp found in log     → proceed to Stage 2
+#     2 — log file not found on node                  → proceed to Stage 2
+# ---------------------------------------------------------------------------
+check_bundle_log_recent(){
+  local ip="$1"
+  local log_file="/var/log/support_bundle.log"
+
+  log "${ip}: [PRE-CHECK Stage 1] verificando geração recente em ${log_file}..."
+
+  local out
+  out="$(root_cmd "$ip" "test -f ${log_file} && tail -100 ${log_file} || echo '__FILE_NOT_FOUND__'")"
+
+  if grep -q '__FILE_NOT_FOUND__' <<< "$out"; then
+    log_warn "${ip}: ${log_file} não encontrado — avançando para Stage 2."
+    return 2
+  fi
+
+  # Extract the most recent YYYY-MM-DD timestamp present in the log.
+  # support_bundle.log uses lines like: "2026-05-14 20:16:01,685 ..."
+  local last_date
+  last_date="$(grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' <<< "$out" | tail -1 || true)"
+
+  if [[ -z "$last_date" ]]; then
+    log_warn "${ip}: nenhuma data encontrada no log — avançando para Stage 2."
+    return 1
+  fi
+
+  # Compare dates using epoch seconds (portable: date -d on Linux)
+  local log_epoch now_epoch cutoff_epoch
+  log_epoch="$(date -d "${last_date}" +%s 2>/dev/null || echo 0)"
+  now_epoch="$(date +%s)"
+  cutoff_epoch=$(( now_epoch - 7 * 86400 ))
+
+  if [[ "$log_epoch" -ge "$cutoff_epoch" ]]; then
+    log_ok "${ip}: log indica bundle gerado em ${last_date} (dentro dos últimos 7 dias) — considerando como existente."
+    return 0
+  else
+    log_warn "${ip}: último registro no log é de ${last_date} (mais de 7 dias) — avançando para Stage 2."
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # check_existing_bundle IP
-#   Detects existing support bundles on the node.
+#   Stage 2 of PRE-CHECK.
+#   Detects existing support bundle .tgz files on the node.
 #   Uses admin_cmd/root_cmd (stderr suppressed) so SSH warnings never
 #   appear in found_files, preventing false-positive bundle detection.
 #   Returns 0 with filenames on stdout if found, 1 otherwise.
@@ -318,11 +378,11 @@ check_existing_bundle(){
     [[ -n "$admin_matches" ]] && found_files="$admin_matches"
   fi
 
-  # Strategy 2: root ls on file-store
+  # Strategy 2: root ls on file-store (glob for support-bundle*.tgz)
   if [[ -z "$found_files" ]]; then
     local root_out
     root_out="$(root_cmd "$ip" \
-      'ls /var/vmware/nsx/file-store/support-bundle* 2>/dev/null || true' || true)"
+      'ls /var/vmware/nsx/file-store/support-bundle*.tgz 2>/dev/null || true' || true)"
     if [[ -n "$root_out" ]] && ! grep -qiE 'no such file|cannot access' <<< "$root_out"; then
       found_files="$root_out"
     fi
@@ -332,6 +392,54 @@ check_existing_bundle(){
     echo "$found_files"
     return 0
   fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# check_bundle_in_progress IP
+#   Stage 3 of PRE-CHECK.
+#   Detects whether a support bundle generation is currently in progress by:
+#     a) Checking for active napi/python processes related to support_bundles
+#     b) Checking for a partial/incomplete .tgz file in file-store
+#   Returns:
+#     0 — generation in progress detected
+#     1 — no active generation detected
+# ---------------------------------------------------------------------------
+check_bundle_in_progress(){
+  local ip="$1"
+  local found=0
+
+  log "${ip}: [PRE-CHECK Stage 3] verificando geração em andamento..."
+
+  # Check a) active process
+  local proc_out
+  proc_out="$(root_cmd "$ip" \
+    "ps aux 2>/dev/null | grep -iE 'support_bundle|support-bundle|napi.*bundle' | grep -v grep || true")"
+  if [[ -n "$proc_out" ]]; then
+    log_warn "${ip}: processo de geração de support bundle detectado em execução:"
+    while IFS= read -r pline; do
+      log_warn "${ip}:   ${pline}"
+    done <<< "$proc_out"
+    found=1
+  fi
+
+  # Check b) partial file in file-store (any file modified in the last 30 min)
+  local partial_out
+  partial_out="$(root_cmd "$ip" \
+    "find /var/vmware/nsx/file-store -maxdepth 1 -name 'support-bundle*' -newer /proc/1 -mmin -30 2>/dev/null || true")"
+  if [[ -n "$partial_out" ]]; then
+    log_warn "${ip}: arquivo de support bundle com escrita recente detectado (possível geração em andamento):"
+    while IFS= read -r fline; do
+      log_warn "${ip}:   ${fline}"
+    done <<< "$partial_out"
+    found=1
+  fi
+
+  if [[ "$found" -eq 1 ]]; then
+    return 0
+  fi
+
+  log "${ip}: nenhuma geração em andamento detectada."
   return 1
 }
 
