@@ -207,8 +207,9 @@ disable_root_ssh(){
 # ---------------------------------------------------------------------------
 request_support_bundle(){
   local ip="$1"
-  admin_cmd "$ip" 'get support-bundle status; start support-bundle' \
-    || admin_cmd "$ip" 'start support-bundle' || true
+  local fname="sb_${ip//./_}_$(date +%Y%m%d_%H%M%S).tgz"
+  log "${ip}: >> get support-bundle file ${fname} log-age 1"
+  admin_cmd "$ip" "get support-bundle file ${fname} log-age 1" || true
 }
 
 check_support_bundle(){
