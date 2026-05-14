@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v2.1
+# deploy_nsx_sb_check.sh  v2.2
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
 # USO:
@@ -34,7 +34,7 @@ mkdir -p \
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v2.1"
+echo "  NSX Edge Automation — Support Bundle Kit  v2.2"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -75,11 +75,11 @@ session.env
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh  — v2.1
+# lib/common.sh  — v2.2
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh  — v2.1
+# lib/common.sh  — v2.2
 # Biblioteca compartilhada para todos os scripts NSX Edge Automation.
 # Autenticação: sempre sshpass (senha). Sem chaves SSH.
 set -euo pipefail
@@ -242,6 +242,48 @@ disable_root_ssh(){
   admin_cmd "$ip" 'clear ssh root-login' || true
   log "${ip}: >> get service ssh"
   admin_cmd "$ip" 'get service ssh' || true
+}
+
+# ---------------------------------------------------------------------------
+# check_bundle_log IP
+#   Lê /var/log/support_bundle.log no node e exibe as últimas 10 linhas.
+#   Detecta palavras-chave de erro/aviso e destaca no terminal.
+#   Requer root SSH habilitado.
+#   Retorna:
+#     0  — log encontrado sem erros
+#     1  — log encontrado COM erros/avisos (imprime aviso no terminal)
+#     2  — arquivo não encontrado
+# ---------------------------------------------------------------------------
+check_bundle_log(){
+  local ip="$1"
+  local log_file="/var/log/support_bundle.log"
+  local out
+
+  log "${ip}: lendo ${log_file} (últimas 10 linhas)..."
+  out="$(root_cmd "$ip" "test -f ${log_file} && tail -10 ${log_file} || echo '__FILE_NOT_FOUND__'" 2>/dev/null || true)"
+
+  if grep -q '__FILE_NOT_FOUND__' <<< "$out"; then
+    log_warn "${ip}: ${log_file} não encontrado — geração anterior pode não ter ocorrido."
+    return 2
+  fi
+
+  # Exibe as 10 linhas no terminal
+  echo ""
+  echo "  ┌─ ${ip}: ${log_file} (últimas 10 linhas) ─────────────────────"
+  while IFS= read -r line; do
+    echo "  │  ${line}"
+  done <<< "$out"
+  echo "  └────────────────────────────────────────────────────────────────"
+  echo ""
+
+  # Verifica erros/avisos
+  if grep -qiE 'error|fail|exception|abort|fatal|warn' <<< "$out"; then
+    log_warn "${ip}: ATENÇÃO — problemas detectados no log da geração anterior (ver acima)."
+    return 1
+  fi
+
+  log_ok "${ip}: log da geração anterior sem erros aparentes."
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -453,12 +495,16 @@ TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_main.sh  — v2.1  (com PRE-CHECK de bundle existente)
+# nsx_sb_main.sh  — v2.2  (PRE-CHECK com check_bundle_log + check_existing_bundle)
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v2.1
+# nsx_sb_main.sh  — v2.2
 # Orquestrador: PRE-CHECK + Fase 1 (solicitar SB) + Fase 2 (verificar a cada 5 min)
+# PRE-CHECK:
+#   1. check_bundle_log()       — lê /var/log/support_bundle.log (últimas 10 linhas)
+#   2. check_existing_bundle()  — detecta bundle já gerado no node
+#   3. prompt_new_bundle()      — pergunta se gera novo (timeout 10s → skip)
 # Recomendado: rodar dentro de screen ou tmux (~35 min no total)
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -475,37 +521,46 @@ RUN_LOG="${LOG_DIR}/sb_run_$(date +%Y%m%d_%H%M%S).log"
 STATUS_CSV="${LOG_DIR}/sb_status_$(date +%Y%m%d_%H%M%S).csv"
 echo 'ip,phase,status,details,timestamp' > "$STATUS_CSV"
 
-# ---- PRE-CHECK: Detecta bundles existentes antes de gerar novos ----
-log "=== PRE-CHECK: Verificando bundles existentes ==="
+# ---- PRE-CHECK ----
+log "=== PRE-CHECK: Verificando log e bundles existentes ==="
 declare -A SKIP_SB
 for ip in "${EDGE_IPS[@]}"; do
   SKIP_SB["$ip"]="false"
 done
 
 for ip in "${EDGE_IPS[@]}"; do
-  log "${ip}: verificando bundle existente..."
-  # Habilita root SSH para que a Estratégia 2 (root ls) esteja disponível
+  log "${ip}: iniciando PRE-CHECK..."
+
+  # Habilita root SSH (necessário para check_bundle_log e check_existing_bundle)
   enable_root_ssh "$ip"
+
+  # [1] Verifica log da geração anterior
+  log_rc=0
+  check_bundle_log "$ip" || log_rc=$?
+  case "$log_rc" in
+    0) printf '%s,precheck,bundle_log,ok,%s\n'           "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV" ;;
+    1) printf '%s,precheck,bundle_log,warn_errors,%s\n'  "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV" ;;
+    2) printf '%s,precheck,bundle_log,not_found,%s\n'    "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV" ;;
+  esac
+
+  # [2] Verifica bundle existente
   existing_files=""
   if existing_files="$(check_existing_bundle "$ip")"; then
     log "${ip}: bundle(s) existente(s) encontrado(s)."
     if ! prompt_new_bundle "$ip" "$existing_files"; then
       SKIP_SB["$ip"]="true"
-      printf '%s,precheck,skipped,existing_bundle_kept,%s\n' "$ip" "$(date +%F_%T)" \
-        | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+      printf '%s,precheck,existing_bundle,skipped,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
     else
       log "${ip}: usuário solicitou novo bundle — prosseguindo."
-      printf '%s,precheck,new_requested,ok,%s\n' "$ip" "$(date +%F_%T)" \
-        | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+      printf '%s,precheck,existing_bundle,new_requested,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
     fi
   else
     log "${ip}: nenhum bundle existente — será gerado."
-    printf '%s,precheck,no_existing_bundle,ok,%s\n' "$ip" "$(date +%F_%T)" \
-      | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+    printf '%s,precheck,existing_bundle,none,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
   fi
 done
 
-# ---- FASE 1: Habilitar root SSH + Solicitar Support Bundle ----
+# ---- FASE 1: Solicitar Support Bundle ----
 log "=== FASE 1: Solicitação do Support Bundle ==="
 for ip in "${EDGE_IPS[@]}"; do
   if [[ "${SKIP_SB[$ip]}" == "true" ]]; then
@@ -523,7 +578,6 @@ log "Fase 1 concluída. Aguardando geração dos bundles..."
 log "=== FASE 2: Verificação ==="
 declare -A NODE_DONE
 for ip in "${EDGE_IPS[@]}"; do
-  # Nós pulados no PRE-CHECK já estão concluídos
   [[ "${SKIP_SB[$ip]}" == "true" ]] && NODE_DONE["$ip"]="true" || NODE_DONE["$ip"]="false"
 done
 
@@ -705,8 +759,11 @@ cd ~/nsx-edge-automation/automations/support_bundle
 ./nsx_sb_main.sh
 ```
 
-O script verifica automaticamente se já existe um support bundle antes de gerar um novo (PRE-CHECK).
-Caso encontre algum arquivo, pergunta se deseja gerar novo — sem resposta em 10s assume "não".
+O script executa um PRE-CHECK completo antes de gerar qualquer bundle:
+1. **check_bundle_log** — lê `/var/log/support_bundle.log` e exibe as últimas 10 linhas.
+   Detecta erros/avisos automaticamente e alerta no terminal.
+2. **check_existing_bundle** — verifica se já existe um bundle gerado.
+3. **prompt_new_bundle** — se encontrar bundle, pergunta se gera novo (timeout 10s → não).
 
 ### 4. Executar comando em todos os nodes
 
@@ -754,8 +811,14 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "================================================================"
-echo "  Deploy concluído! v2.1"
+echo "  Deploy concluído! v2.2"
 echo "================================================================"
+echo ""
+echo "  Novidades v2.2:"
+echo "    - check_bundle_log(): lê /var/log/support_bundle.log"
+echo "      Exibe últimas 10 linhas no terminal durante o PRE-CHECK"
+echo "      Detecta error|fail|exception|abort|fatal|warn no log"
+echo "    - PRE-CHECK agora: log → bundle existente → prompt"
 echo ""
 echo "  Novidades v2.1:"
 echo "    - PRE-CHECK: detecta bundles existentes antes de gerar novos"
