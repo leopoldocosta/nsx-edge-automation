@@ -200,21 +200,20 @@ disable_root_ssh(){
 #
 # request_support_bundle:
 #   Comando correto NSX Edge CLI (admin):
-#     get support-bundle file <filename> log-age 1 all
-#   Usa log-age 1 (1 dia) conforme padrao do ambiente.
+#     get support-bundle file <filename> log-age 1
+#   Usa log-age 1 (1 dia). Sem o parametro 'all'.
 #   Nome do arquivo inclui IP e timestamp para identificacao.
 #
 # check_support_bundle:
 #   Via admin : get files  -- lista arquivos gerados no node
 #   Via root  : tail -30 /var/log/support_bundle  -- status de geracao
-#   Retorna bloco formatado para consolidacao no relatorio final.
 # ---------------------------------------------------------------------------
 request_support_bundle(){
   local ip="$1"
   local fname
   fname="support-bundle-${ip//\./-}-$(date +%Y%m%d_%H%M%S).tgz"
   log "${ip}: requesting support bundle (log-age 1 day) -> ${fname}"
-  admin_cmd "$ip" "get support-bundle file ${fname} log-age 1 all" || true
+  admin_cmd "$ip" "get support-bundle file ${fname} log-age 1" || true
 }
 
 check_support_bundle(){
@@ -241,7 +240,6 @@ check_support_bundle(){
 # ---------------------------------------------------------------------------
 # print_final_report  <status_csv>
 # Le o CSV gerado pelo nsx_sb_main.sh e imprime visao consolidada por no.
-# Exibe: tabela completa de eventos + resumo final de cada bundle.
 # ---------------------------------------------------------------------------
 print_final_report(){
   local csv="$1"
@@ -266,7 +264,6 @@ print_final_report(){
   printf '%-18s %-12s %s\n' "NODE IP" "RESULTADO" "DETALHES"
   echo "${sep}"
 
-  # Ultima entrada phase2 de cada no = resultado definitivo
   tail -n +2 "$csv" | awk -F',' '
     $2=="phase2" { last[$1]=$3" | "$4" | "$5 }
     END {
