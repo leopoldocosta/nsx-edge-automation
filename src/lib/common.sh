@@ -84,11 +84,82 @@ request_support_bundle(){
     || admin_cmd "$ip" 'start support-bundle' || true
 }
 
+# check_support_bundle: dupla validação diretamente no edge node
+#   1. Lê /var/log/support_bundle e procura pela linha de conclusão real:
+#      "Support bundle saved to: /var/vmware/nsx/file-store/..."
+#   2. Valida que o arquivo .tgz existe em /var/vmware/nsx/file-store/
+#      e retorna nome + tamanho.
+#   Retorna:
+#     SUCCESS:<caminho_do_bundle>  — bundle concluído e arquivo presente
+#     PENDING                     — log não contém linha de conclusão ainda
+#     LOG_NOT_FOUND               — /var/log/support_bundle não existe
+#     FILE_NOT_FOUND              — log diz concluído mas .tgz ausente (race condition)
 check_support_bundle(){
   local ip="$1"
-  local out1 out2 out3
-  out1="$(root_cmd "$ip" "test -f /var/log/support_bundle && tail -50 /var/log/support_bundle || echo FILE_NOT_FOUND")"
-  out2="$(root_cmd "$ip" "find /var/log /storage /tmp -maxdepth 3 \( -name '*support*bundle*' -o -name '*.tgz' -o -name '*.tar.gz' \) -type f 2>/dev/null | head -20")"
-  out3="$(root_cmd "$ip" "getent passwd root >/dev/null 2>&1; echo ROOT_OK")"
-  printf '%s\n----FILES----\n%s\n----ROOT----\n%s\n' "$out1" "$out2" "$out3"
+
+  # Passo 1 — procura linha de conclusão no log do próprio edge
+  local log_check
+  log_check="$(root_cmd "$ip" "
+    if [[ ! -f /var/log/support_bundle ]]; then
+      echo LOG_NOT_FOUND
+    else
+      grep -m1 'Support bundle saved to:' /var/log/support_bundle 2>/dev/null || echo PENDING
+    fi
+  ")"
+
+  case "$log_check" in
+    LOG_NOT_FOUND)
+      echo "LOG_NOT_FOUND"
+      return
+      ;;
+    PENDING)
+      echo "PENDING"
+      return
+      ;;
+  esac
+
+  # Passo 2 — extrai caminho do bundle e confirma existência do arquivo
+  local bundle_path
+  bundle_path="$(echo "$log_check" | grep -oP '/var/vmware/nsx/file-store/\S+')"
+
+  if [[ -z "$bundle_path" ]]; then
+    # log_check continha a linha mas sem caminho reconhecível — fallback por find
+    bundle_path="$(root_cmd "$ip" "
+      find /var/vmware/nsx/file-store/ -maxdepth 1 -name 'support-bundle-*.tgz' \
+        -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | awk '{print \$2}'
+    ")"
+  fi
+
+  if [[ -z "$bundle_path" ]]; then
+    echo "FILE_NOT_FOUND"
+    return
+  fi
+
+  # Passo 3 — confirma que o arquivo existe e pega tamanho
+  local file_info
+  file_info="$(root_cmd "$ip" "ls -lh \"${bundle_path}\" 2>/dev/null || echo FILE_NOT_FOUND")"
+
+  if grep -q 'FILE_NOT_FOUND' <<< "$file_info"; then
+    echo "FILE_NOT_FOUND"
+  else
+    echo "SUCCESS:${bundle_path}"
+  fi
+}
+
+# list_old_bundles: lista todos os .tgz em /var/vmware/nsx/file-store/ do edge
+# Retorna linhas no formato: <tamanho_humano> <data_modificacao> <caminho>
+list_old_bundles(){
+  local ip="$1"
+  root_cmd "$ip" "
+    find /var/vmware/nsx/file-store/ -maxdepth 1 -name 'support-bundle-*.tgz' \
+      -printf '%TY-%Tm-%Td %TH:%TM  %s  %p\n' 2>/dev/null \
+    | awk '{printf \"%s %s  %6.1f GB  %s\\n\", \$1, \$2, \$3/1073741824, \$4}' \
+    | sort
+  " 2>/dev/null || echo "NONE"
+}
+
+# delete_bundle: remove arquivo específico do edge
+delete_bundle(){
+  local ip="$1" path="$2"
+  root_cmd "$ip" "rm -f \"${path}\" && echo DELETED || echo DELETE_FAILED"
 }

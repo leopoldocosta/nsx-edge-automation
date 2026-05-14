@@ -43,28 +43,56 @@ done
 log "Phase 1 complete. Waiting for bundles to generate..."
 
 # ---- PHASE 2: Verify every 5 min for up to 30 min ----
+# Detecção dupla:
+#   1. grep por 'Support bundle saved to:' em /var/log/support_bundle (sinal real)
+#   2. confirmação de existência do .tgz em /var/vmware/nsx/file-store/
 log "=== PHASE 2: Support Bundle Verification ==="
 declare -A NODE_DONE
-for ip in "${EDGE_IPS[@]}"; do NODE_DONE["$ip"]="false"; done
+declare -A NODE_BUNDLE_PATH
+for ip in "${EDGE_IPS[@]}"; do
+  NODE_DONE["$ip"]="false"
+  NODE_BUNDLE_PATH["$ip"]=""
+done
 
 for ((i=1;i<=6;i++)); do
-  log "Check round ${i}/6 — waiting 5 min..."
+  log "Verificação ${i}/6 — aguardando 5 min..."
   sleep 300
   for ip in "${EDGE_IPS[@]}"; do
     [[ "${NODE_DONE[$ip]}" == "true" ]] && continue
-    OUT="$(check_support_bundle "$ip" || true)"
-    if grep -qiE 'error|fail|unable|denied' <<< "$OUT"; then
-      log "${ip}: ERROR detected."
-      printf '%s,phase2,error,%q,%s\n' "$ip" "$OUT" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-      NODE_DONE["$ip"]="true"
-    elif grep -qiE 'complete|generated|success' <<< "$OUT" && ! grep -q 'FILE_NOT_FOUND' <<< "$OUT"; then
-      log "${ip}: SUCCESS — bundle confirmed."
-      printf '%s,phase2,success,%q,%s\n' "$ip" "$OUT" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-      NODE_DONE["$ip"]="true"
-    else
-      log "${ip}: still pending..."
-      printf '%s,phase2,pending,%q,%s\n' "$ip" "$OUT" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-    fi
+
+    OUT="$(check_support_bundle "$ip" || echo 'CHECK_ERROR')"
+
+    case "$OUT" in
+      SUCCESS:*)
+        BPATH="${OUT#SUCCESS:}"
+        NODE_BUNDLE_PATH["$ip"]="$BPATH"
+        log "[OK] ${ip}: bundle confirmado em ${BPATH}"
+        printf '%s,phase2,success,%q,%s\n' "$ip" "$BPATH" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+        NODE_DONE["$ip"]="true"
+        ;;
+      PENDING)
+        log "[WARN] ${ip}: ainda pendente..."
+        printf '%s,phase2,pending,log_sem_conclusao,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+        ;;
+      LOG_NOT_FOUND)
+        log "[WARN] ${ip}: /var/log/support_bundle não encontrado — bundle ainda não iniciou ou caminho diferente."
+        printf '%s,phase2,pending,log_not_found,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+        ;;
+      FILE_NOT_FOUND)
+        log "[WARN] ${ip}: log indica conclusão mas .tgz ausente no file-store — possível race condition, re-verificando na próxima rodada."
+        printf '%s,phase2,pending,file_not_found_yet,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+        ;;
+      CHECK_ERROR)
+        log "[ERROR] ${ip}: falha ao conectar via SSH durante verificação."
+        printf '%s,phase2,error,ssh_check_failed,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+        NODE_DONE["$ip"]="true"
+        ;;
+      *)
+        log "[ERROR] ${ip}: resposta inesperada — ${OUT}"
+        printf '%s,phase2,error,%q,%s\n' "$ip" "$OUT" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+        NODE_DONE["$ip"]="true"
+        ;;
+    esac
   done
 done
 
@@ -77,4 +105,37 @@ done
 
 clear_creds
 rm -f "${RUN_DIR}/session.env" 2>/dev/null || true
-log "Execution complete. Status CSV: $STATUS_CSV"
+log "Execução concluída. Status CSV: $STATUS_CSV"
+
+# ---- PÓS-EXECUÇÃO: verificar se há bundles antigos e oferecer limpeza ----
+log "=== Verificando bundles no file-store de cada node ==="
+HAS_OLD_BUNDLES="false"
+for ip in "${EDGE_IPS[@]}"; do
+  # Reabilita root SSH temporariamente só para listar
+  enable_root_ssh "$ip" 2>/dev/null || true
+  BUNDLES="$(list_old_bundles "$ip" || echo 'NONE')"
+  disable_root_ssh "$ip" 2>/dev/null || true
+
+  COUNT="$(echo "$BUNDLES" | grep -vc '^$\|^NONE' || true)"
+  if [[ "$COUNT" -gt 0 ]]; then
+    HAS_OLD_BUNDLES="true"
+    log "${ip}: ${COUNT} bundle(s) encontrado(s):"
+    echo "$BUNDLES" | while IFS= read -r line; do
+      [[ -n "$line" ]] && echo "    ${line}"
+    done
+  fi
+done
+
+if [[ "$HAS_OLD_BUNDLES" == "true" ]]; then
+  echo ""
+  echo "================================================================"
+  echo "  Foram encontrados support bundles no file-store dos edge nodes."
+  echo "  Bundles antigos consomem espaço em disco (cada um ~1-3 GB)."
+  echo "================================================================"
+  read -rp "  Deseja executar o módulo de limpeza agora? [s/N]: " RUN_CLEANUP
+  if [[ "${RUN_CLEANUP,,}" == "s" ]]; then
+    bash "${SCRIPT_DIR}/sb_cleanup.sh"
+  else
+    log "Limpeza ignorada. Execute manualmente: bash src/sb_cleanup.sh"
+  fi
+fi
