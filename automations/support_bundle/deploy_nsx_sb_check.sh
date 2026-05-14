@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v4.0
+# deploy_nsx_sb_check.sh  v2.1
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
 # USO:
@@ -34,7 +34,7 @@ mkdir -p \
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v4.0"
+echo "  NSX Edge Automation — Support Bundle Kit  v2.1"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -75,11 +75,11 @@ session.env
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh
+# lib/common.sh  — v2.1
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh
+# lib/common.sh  — v2.1
 # Biblioteca compartilhada para todos os scripts NSX Edge Automation.
 # Autenticação: sempre sshpass (senha). Sem chaves SSH.
 set -euo pipefail
@@ -153,7 +153,6 @@ load_ips(){
 
 # ---------------------------------------------------------------------------
 # Credenciais — coletadas interativamente UMA VEZ e reutilizadas
-# Armazenadas apenas em memória, nunca em disco.
 # ---------------------------------------------------------------------------
 ask_admin_creds(){
   if [[ -n "${NSX_PASS:-}" ]]; then
@@ -243,6 +242,75 @@ disable_root_ssh(){
   admin_cmd "$ip" 'clear ssh root-login' || true
   log "${ip}: >> get service ssh"
   admin_cmd "$ip" 'get service ssh' || true
+}
+
+# ---------------------------------------------------------------------------
+# check_existing_bundle IP
+#   Detecta se já existe um support bundle no nó, usando duas estratégias:
+#   Estratégia 1 (admin): executa 'get files' e filtra linhas com support-bundle
+#   Estratégia 2 (root) : ls /var/vmware/nsx/file-store/support-bundle*
+#   Retorna 0 com nomes de arquivo no stdout se encontrado, 1 caso contrário.
+# ---------------------------------------------------------------------------
+check_existing_bundle(){
+  local ip="$1"
+  local found_files=""
+
+  # Estratégia 1: admin 'get files'
+  local admin_out
+  admin_out="$(admin_cmd "$ip" 'get files' 2>/dev/null || true)"
+  if [[ -n "$admin_out" ]]; then
+    local admin_matches
+    admin_matches="$(grep -iE 'support-bundle' <<< "$admin_out" || true)"
+    [[ -n "$admin_matches" ]] && found_files="$admin_matches"
+  fi
+
+  # Estratégia 2: root ls no file-store (requer root SSH habilitado)
+  if [[ -z "$found_files" ]]; then
+    local root_out
+    root_out="$(root_cmd "$ip" \
+      'ls /var/vmware/nsx/file-store/support-bundle* 2>/dev/null || true' 2>/dev/null || true)"
+    if [[ -n "$root_out" ]] && ! grep -qiE 'no such file|cannot access' <<< "$root_out"; then
+      found_files="$root_out"
+    fi
+  fi
+
+  if [[ -n "$found_files" ]]; then
+    echo "$found_files"
+    return 0
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# prompt_new_bundle IP FILES
+#   Pergunta ao usuário se deseja gerar um NOVO bundle quando já existe um.
+#   Timeout de 10 segundos sem resposta = skip automático (padrão: não).
+#   Retorna 0 para gerar novo, 1 para pular.
+# ---------------------------------------------------------------------------
+prompt_new_bundle(){
+  local ip="$1"
+  local files="$2"
+  local reply
+
+  echo ""
+  echo "  *** Support bundle já existe em ${ip} ***"
+  echo "  Arquivos encontrados:"
+  while IFS= read -r f; do
+    echo "    ${f}"
+  done <<< "$files"
+  echo ""
+
+  if read -r -t 10 -p "  Gerar um NOVO support bundle para ${ip}? [s/N] (skip automático em 10s): " reply </dev/tty; then
+    echo ""
+    case "${reply,,}" in
+      s|y|sim|yes) return 0 ;;
+      *) log "${ip}: Geração de novo bundle cancelada pelo usuário."; return 1 ;;
+    esac
+  else
+    echo ""
+    log "${ip}: Sem resposta em 10 segundos — pulando geração de bundle."
+    return 1
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -385,11 +453,12 @@ TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_main.sh
+# nsx_sb_main.sh  — v2.1  (com PRE-CHECK de bundle existente)
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh - Orquestrador: Fase 1 (solicitar SB) + Fase 2 (verificar a cada 5 min)
+# nsx_sb_main.sh  — v2.1
+# Orquestrador: PRE-CHECK + Fase 1 (solicitar SB) + Fase 2 (verificar a cada 5 min)
 # Recomendado: rodar dentro de screen ou tmux (~35 min no total)
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -406,9 +475,43 @@ RUN_LOG="${LOG_DIR}/sb_run_$(date +%Y%m%d_%H%M%S).log"
 STATUS_CSV="${LOG_DIR}/sb_status_$(date +%Y%m%d_%H%M%S).csv"
 echo 'ip,phase,status,details,timestamp' > "$STATUS_CSV"
 
+# ---- PRE-CHECK: Detecta bundles existentes antes de gerar novos ----
+log "=== PRE-CHECK: Verificando bundles existentes ==="
+declare -A SKIP_SB
+for ip in "${EDGE_IPS[@]}"; do
+  SKIP_SB["$ip"]="false"
+done
+
+for ip in "${EDGE_IPS[@]}"; do
+  log "${ip}: verificando bundle existente..."
+  # Habilita root SSH para que a Estratégia 2 (root ls) esteja disponível
+  enable_root_ssh "$ip"
+  existing_files=""
+  if existing_files="$(check_existing_bundle "$ip")"; then
+    log "${ip}: bundle(s) existente(s) encontrado(s)."
+    if ! prompt_new_bundle "$ip" "$existing_files"; then
+      SKIP_SB["$ip"]="true"
+      printf '%s,precheck,skipped,existing_bundle_kept,%s\n' "$ip" "$(date +%F_%T)" \
+        | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+    else
+      log "${ip}: usuário solicitou novo bundle — prosseguindo."
+      printf '%s,precheck,new_requested,ok,%s\n' "$ip" "$(date +%F_%T)" \
+        | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+    fi
+  else
+    log "${ip}: nenhum bundle existente — será gerado."
+    printf '%s,precheck,no_existing_bundle,ok,%s\n' "$ip" "$(date +%F_%T)" \
+      | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+  fi
+done
+
 # ---- FASE 1: Habilitar root SSH + Solicitar Support Bundle ----
 log "=== FASE 1: Solicitação do Support Bundle ==="
 for ip in "${EDGE_IPS[@]}"; do
+  if [[ "${SKIP_SB[$ip]}" == "true" ]]; then
+    log "${ip}: pulando solicitação (bundle existente mantido)."
+    continue
+  fi
   enable_root_ssh "$ip"
   printf '%s,phase1,root_ssh_enabled,ok,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
   request_support_bundle "$ip"
@@ -419,7 +522,10 @@ log "Fase 1 concluída. Aguardando geração dos bundles..."
 # ---- FASE 2: Verificar a cada 5 min, por até 30 min (6 rodadas) ----
 log "=== FASE 2: Verificação ==="
 declare -A NODE_DONE
-for ip in "${EDGE_IPS[@]}"; do NODE_DONE["$ip"]="false"; done
+for ip in "${EDGE_IPS[@]}"; do
+  # Nós pulados no PRE-CHECK já estão concluídos
+  [[ "${SKIP_SB[$ip]}" == "true" ]] && NODE_DONE["$ip"]="true" || NODE_DONE["$ip"]="false"
+done
 
 for ((round=1; round<=6; round++)); do
   log "Verificação ${round}/6 — aguardando 5 min..."
@@ -599,6 +705,9 @@ cd ~/nsx-edge-automation/automations/support_bundle
 ./nsx_sb_main.sh
 ```
 
+O script verifica automaticamente se já existe um support bundle antes de gerar um novo (PRE-CHECK).
+Caso encontre algum arquivo, pergunta se deseja gerar novo — sem resposta em 10s assume "não".
+
 ### 4. Executar comando em todos os nodes
 
 ```bash
@@ -645,8 +754,13 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "================================================================"
-echo "  Deploy concluído!"
+echo "  Deploy concluído! v2.1"
 echo "================================================================"
+echo ""
+echo "  Novidades v2.1:"
+echo "    - PRE-CHECK: detecta bundles existentes antes de gerar novos"
+echo "    - admin 'get files' + root ls /var/vmware/nsx/file-store/"
+echo "    - Prompt interativo com timeout de 10s (padrão: não gerar)"
 echo ""
 echo "Próximos passos:"
 echo "  1. Edite o arquivo de IPs:"
