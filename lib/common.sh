@@ -85,8 +85,10 @@ load_ips(){
 
 # ---------------------------------------------------------------------------
 # Credentials
+# Passwords are stored internally as raw strings (read -r).
+# When passed to sshpass, they are written to a temp file (fd) to avoid
+# shell word-splitting and to handle any special characters safely.
 # Collected ONCE and reused for all nodes.
-# ask_admin_creds / ask_root_creds sao no-op se variaveis ja existirem.
 # ---------------------------------------------------------------------------
 ask_admin_creds(){
   if [[ -n "${NSX_PASS:-}" ]]; then
@@ -116,49 +118,7 @@ clear_creds(){
 }
 
 # ---------------------------------------------------------------------------
-# ask_clear_creds
-#
-# Pergunta ao final de cada script se o usuario deseja limpar as credenciais
-# da memoria (NSX_PASS, ROOT_PASS, NSX_USER).
-#
-# Padrao YES: pressionar Enter limpa e encerra.
-# Digitar N/no mantem as credenciais para o proximo script na mesma sessao.
-# Qualquer entrada nao reconhecida aplica padrao YES por seguranca.
-#
-# Uso: adicione ao final de cada script de automacao:
-#   ask_clear_creds
-# ---------------------------------------------------------------------------
-ask_clear_creds(){
-  echo ""
-  echo "============================================================"
-  printf "  Clear credentials from memory? [Y/n] (default: Yes): "
-  local _answer
-  IFS= read -r _answer
-  case "${_answer,,}" in
-    ""|y|ye|yes|sim|s)
-      clear_creds
-      log "Session ended. Credentials removed from memory."
-      ;;
-    n|no|nao)
-      log "Credentials kept in memory for this shell session."
-      echo ""
-      echo "  You can now run any other script without re-entering credentials:"
-      echo "    cd ~/nsx-edge-automation/automations/support_bundle && ./nsx_sb_main.sh"
-      echo "    cd ~/nsx-edge-automation/automations/ssh_cli        && ./nsx_ssh_cli.sh"
-      echo ""
-      ;;
-    *)
-      log_warn "Unrecognized input '${_answer}' -- defaulting to YES, clearing credentials."
-      clear_creds
-      ;;
-  esac
-  echo "============================================================"
-  echo ""
-}
-
-# ---------------------------------------------------------------------------
-# SSH helper: escreve senha em arquivo temporario privado.
-# Evita exposicao em argumentos de processo. Funciona com qualquer char especial.
+# SSH helper: write password to a private temp file, pass via SSHPASS env var.
 # ---------------------------------------------------------------------------
 _sshpass_safe(){
   local _passvar="$1"; shift
@@ -212,60 +172,109 @@ ssh_root(){
   fi
 }
 
-# Exibe o comando no terminal antes de executar (stderr para nao poluir stdout)
-admin_cmd(){
-  local ip="$1" cmd="$2"
-  printf '[CMD] admin@%s >>> %s\n' "$ip" "$cmd" >&2
-  ssh_admin "$ip" "$cmd" 2>&1
-}
-
-root_cmd(){
-  local ip="$1" cmd="$2"
-  printf '[CMD] root@%s >>> %s\n' "$ip" "$cmd" >&2
-  ssh_root "$ip" "$cmd" 2>&1
-}
+admin_cmd(){ local ip="$1" cmd="$2"; ssh_admin "$ip" "$cmd" 2>&1; }
+root_cmd(){  local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>&1; }
 
 # ---------------------------------------------------------------------------
-# Root SSH Control -- comandos corretos NSX-T Edge
-#
-# HABILITAR root login : set ssh root-login
-# DESABILITAR root login: clear ssh root-login
-# VERIFICAR estado      : get service ssh
-#
-# IMPORTANTE: NAO usar 'start service ssh' nem 'set service ssh enabled'
-# O servico SSH ja esta ativo no Edge Node. Apenas o root-login precisa ser
-# habilitado/desabilitado conforme necessidade.
+# Root SSH Control
+# Comandos corretos NSX Edge CLI:
+#   Habilitar : set ssh root-login   + get service ssh  (validacao)
+#   Desabilitar: clear ssh root-login + get service ssh  (validacao)
 # ---------------------------------------------------------------------------
 enable_root_ssh(){
   local ip="$1"
-  log "${ip}: enabling root SSH login..."
+  log "${ip}: enabling root SSH..."
   admin_cmd "$ip" 'set ssh root-login' || true
   admin_cmd "$ip" 'get service ssh'    || true
 }
 
 disable_root_ssh(){
   local ip="$1"
-  log "${ip}: disabling root SSH login..."
+  log "${ip}: disabling root SSH..."
   admin_cmd "$ip" 'clear ssh root-login' || true
-  admin_cmd "$ip" 'get service ssh'       || true
+  admin_cmd "$ip" 'get service ssh'      || true
 }
 
 # ---------------------------------------------------------------------------
 # Support Bundle helpers
+#
+# request_support_bundle:
+#   Comando correto NSX Edge CLI (admin):
+#     get support-bundle file <filename> log-age 1 all
+#   Usa log-age 1 (1 dia) conforme padrao do ambiente.
+#   Nome do arquivo inclui IP e timestamp para identificacao.
+#
+# check_support_bundle:
+#   Via admin : get files  -- lista arquivos gerados no node
+#   Via root  : tail -30 /var/log/support_bundle  -- status de geracao
+#   Retorna bloco formatado para consolidacao no relatorio final.
 # ---------------------------------------------------------------------------
 request_support_bundle(){
   local ip="$1"
-  admin_cmd "$ip" 'get support-bundle status; start support-bundle' \
-    || admin_cmd "$ip" 'start support-bundle' || true
+  local fname
+  fname="support-bundle-${ip//\./-}-$(date +%Y%m%d_%H%M%S).tgz"
+  log "${ip}: requesting support bundle (log-age 1 day) -> ${fname}"
+  admin_cmd "$ip" "get support-bundle file ${fname} log-age 1 all" || true
 }
 
 check_support_bundle(){
   local ip="$1"
-  local out_log out_files out_root
+  local out_files out_log
+
+  # Via admin: lista arquivos presentes no node
+  out_files="$(admin_cmd "$ip" 'get files' || echo 'ADMIN_CMD_FAILED')"
+
+  # Via root: verifica log de geracao do support bundle
   out_log="$(root_cmd "$ip" \
-    "test -f /var/log/support_bundle && tail -50 /var/log/support_bundle || echo FILE_NOT_FOUND")"
-  out_files="$(root_cmd "$ip" \
-    "find /var/log /storage /tmp -maxdepth 3 \( -name '*support*bundle*' -o -name '*.tgz' -o -name '*.tar.gz' \) -type f 2>/dev/null | head -20")"
-  out_root="$(root_cmd "$ip" "getent passwd root >/dev/null 2>&1; echo ROOT_OK")"
-  printf '%s\n----FILES----\n%s\n----ROOT----\n%s\n' "$out_log" "$out_files" "$out_root"
+    'if [ -f /var/log/support_bundle ]; then
+       echo "=== /var/log/support_bundle (ultimas 30 linhas) ===";
+       tail -30 /var/log/support_bundle;
+     else
+       echo "FILE_NOT_FOUND: /var/log/support_bundle nao existe";
+     fi' \
+    || echo 'ROOT_CMD_FAILED')"
+
+  printf '=== %s: get files ===\n%s\n\n=== %s: /var/log/support_bundle ===\n%s\n' \
+    "$ip" "$out_files" "$ip" "$out_log"
+}
+
+# ---------------------------------------------------------------------------
+# print_final_report  <status_csv>
+# Le o CSV gerado pelo nsx_sb_main.sh e imprime visao consolidada por no.
+# Exibe: tabela completa de eventos + resumo final de cada bundle.
+# ---------------------------------------------------------------------------
+print_final_report(){
+  local csv="$1"
+  local sep
+  sep=$(printf '%0.s-' {1..72})
+
+  echo ""
+  echo "${sep}"
+  echo "  RELATORIO CONSOLIDADO - NSX EDGE SUPPORT BUNDLES"
+  echo "${sep}"
+  printf '%-18s %-14s %-12s %-22s %s\n' "NODE IP" "FASE" "STATUS" "TIMESTAMP" "DETALHES"
+  echo "${sep}"
+
+  tail -n +2 "$csv" | awk -F',' '{
+    printf "%-18s %-14s %-12s %-22s %s\n", $1, $2, $3, $5, $4
+  }'
+
+  echo "${sep}"
+  echo ""
+  echo "=== RESULTADO FINAL DOS BUNDLES POR NO ==="
+  echo "${sep}"
+  printf '%-18s %-12s %s\n' "NODE IP" "RESULTADO" "DETALHES"
+  echo "${sep}"
+
+  # Ultima entrada phase2 de cada no = resultado definitivo
+  tail -n +2 "$csv" | awk -F',' '
+    $2=="phase2" { last[$1]=$3" | "$4" | "$5 }
+    END {
+      for (ip in last)
+        printf "%-18s %-12s %s\n", ip, (last[ip] ~ /success/ ? "SUCCESS" : (last[ip] ~ /error/ ? "ERROR" : "PENDING")), last[ip]
+    }
+  ' | sort
+
+  echo "${sep}"
+  echo ""
 }
