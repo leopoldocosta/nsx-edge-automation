@@ -187,13 +187,19 @@ root_cmd(){  local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>&1; }
 enable_root_ssh(){
   local ip="$1"
   log "${ip}: enabling root SSH..."
-  admin_cmd "$ip" 'set service ssh enabled; start service ssh; set service ssh root-login enabled' || true
+  log "${ip}: >> set ssh root-login"
+  admin_cmd "$ip" 'set ssh root-login' || true
+  log "${ip}: >> get service ssh"
+  admin_cmd "$ip" 'get service ssh' || true
 }
 
 disable_root_ssh(){
   local ip="$1"
   log "${ip}: disabling root SSH..."
-  admin_cmd "$ip" 'set service ssh root-login disabled' || true
+  log "${ip}: >> clear ssh root-login"
+  admin_cmd "$ip" 'clear ssh root-login' || true
+  log "${ip}: >> get service ssh"
+  admin_cmd "$ip" 'get service ssh' || true
 }
 
 # ---------------------------------------------------------------------------
@@ -201,32 +207,8 @@ disable_root_ssh(){
 # ---------------------------------------------------------------------------
 request_support_bundle(){
   local ip="$1"
-  local fname="nsx_sb_${ip}.tgz"
-  log "${ip}: disparando support bundle em background (fire-and-forget)..."
-  # O comando é disparado via SSH e desacoplado imediatamente (&).
-  # Não aguardamos retorno — o NSX continua gerando internamente.
-  # Progresso monitorado via root em /var/log/support_bundle (PHASE 2).
-  if [[ -f "${ADMIN_KEY}" ]]; then
-    ssh -i "${ADMIN_KEY}" \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o ConnectTimeout=15 \
-        -o BatchMode=yes \
-        -o ServerAliveInterval=0 \
-        "admin@${ip}" \
-        "get support-bundle file ${fname} log-age 1" \
-        </dev/null >/dev/null 2>&1 &
-  else
-    SSHPASS="${NSX_PASS}" sshpass -e \
-        ssh -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null \
-            -o ConnectTimeout=15 \
-            -o ServerAliveInterval=0 \
-            "${NSX_USER}@${ip}" \
-            "get support-bundle file ${fname} log-age 1" \
-            </dev/null >/dev/null 2>&1 &
-  fi
-  log "${ip}: SSH disparado em background (PID $!). Verificacao sera feita via root em /var/log/support_bundle."
+  admin_cmd "$ip" 'get support-bundle status; start support-bundle' \
+    || admin_cmd "$ip" 'start support-bundle' || true
 }
 
 check_support_bundle(){
