@@ -1,26 +1,22 @@
 #!/usr/bin/env bash
-# admin_exec.sh - Run any NSX-T admin CLI command on selected or all Edge Nodes
+# admin_exec.sh - Run a single NSX CLI command on all Edge Nodes as admin.
+# Usage: ./admin_exec.sh
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
 source "${SCRIPT_DIR}/../../lib/common.sh"
 
+need_cmd ssh
+need_cmd sshpass
 load_ips
-[[ -f "${ADMIN_KEY}" ]] || ask_admin_creds
+ask_admin_creds
 
-echo ""
-echo "Edge Nodes:"
-for i in "${!EDGE_IPS[@]}"; do printf '  [%d] %s\n' "$((i+1))" "${EDGE_IPS[$i]}"; done
-echo "  [A] All nodes"
-echo ""
-read -rp 'Select node (number or A): ' SEL
-read -rp 'NSX-T admin CLI command: '   CMD
-echo ""
+read -rp "NSX CLI command to run on all nodes: " NSX_CMD
+[[ -z "${NSX_CMD}" ]] && { log_err "No command provided."; exit 1; }
 
-run(){ echo "===== admin@${1} ====="; admin_cmd "$1" "$CMD" || true; echo; }
+for ip in "${EDGE_IPS[@]}"; do
+  log "${ip}: >> ${NSX_CMD}"
+  admin_cmd "$ip" "${NSX_CMD}" || log_warn "${ip}: command returned non-zero"
+done
 
-if   [[ "${SEL^^}" == "A" ]]; then for ip in "${EDGE_IPS[@]}"; do run "$ip"; done
-elif [[ "$SEL" =~ ^[0-9]+$ ]] && (( SEL >= 1 && SEL <= ${#EDGE_IPS[@]} )); then run "${EDGE_IPS[$((SEL-1))]}"
-else echo "[ERROR] Invalid selection."; exit 1; fi
-
-clear_creds
+prompt_clear_creds

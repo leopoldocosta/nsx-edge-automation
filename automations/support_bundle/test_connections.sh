@@ -1,19 +1,15 @@
 #!/usr/bin/env bash
-# test_connections.sh - Validate connectivity, admin + root access. Disables root SSH at end.
+# test_connections.sh - Validate connectivity, admin + root access.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
 source "${SCRIPT_DIR}/../../lib/common.sh"
 
 need_cmd ssh
+need_cmd sshpass
 load_ips
-
-# Credenciais admin: coletadas uma vez, reutilizadas em todos os nos
-[[ -f "${ADMIN_KEY}" ]] || { need_cmd sshpass; ask_admin_creds; }
-
-# Credenciais root: coletadas uma vez, reutilizadas em todos os nos
-# Nao pede novamente dentro do loop
-[[ -f "${ROOT_KEY}" ]] || ask_root_creds
+ask_admin_creds
+ask_root_creds
 
 REPORT="${LOG_DIR}/test_$(date +%Y%m%d_%H%M%S).log"
 log "Test report: ${REPORT}"
@@ -59,5 +55,5 @@ for ip in "${EDGE_IPS[@]}"; do
   } | tee -a "$REPORT"
 done
 
-clear_creds
 log_ok "Test complete. Report: ${REPORT}"
+prompt_clear_creds

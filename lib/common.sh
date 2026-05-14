@@ -3,6 +3,8 @@
 # Shared library for all NSX Edge automations.
 # Provides: SSH access (admin + root), IP loading, credential handling.
 #
+# Authentication: always sshpass (password-based). No SSH key logic.
+#
 # Usage in any automation script:
 #   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #   export AUTO_DIR="${SCRIPT_DIR}"
@@ -16,13 +18,10 @@ AUTO_DIR="${AUTO_DIR:-$(pwd)}"
 
 LOG_DIR="${AUTO_DIR}/logs"
 RUN_DIR="${AUTO_DIR}/run"
-KEY_DIR="${AUTO_DIR}/.ssh_keys"
 EDGE_FILE="${AUTO_DIR}/edge_nodes.txt"
 EDGE_EXAMPLE="${AUTO_DIR}/edge_nodes.example"
-ADMIN_KEY="${KEY_DIR}/nsx_admin_key"
-ROOT_KEY="${KEY_DIR}/nsx_root_key"
 
-mkdir -p "${LOG_DIR}" "${RUN_DIR}" "${KEY_DIR}"
+mkdir -p "${LOG_DIR}" "${RUN_DIR}"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -44,8 +43,6 @@ need_cmd(){
 
 # ---------------------------------------------------------------------------
 # IP Management
-# IPs live in edge_nodes.txt inside each automation's own folder.
-# Never committed. Template: edge_nodes.example
 # ---------------------------------------------------------------------------
 collect_ips(){
   if [[ -f "${EDGE_EXAMPLE}" ]]; then
@@ -85,20 +82,16 @@ load_ips(){
 
 # ---------------------------------------------------------------------------
 # Credentials
-# Passwords are stored internally as raw strings (read -r).
-# When passed to sshpass, they are written to a temp file (fd) to avoid
-# shell word-splitting and to handle any special characters safely.
-# Collected ONCE and reused for all nodes.
+# Collected interactively ONCE per session and reused for all nodes.
+# Passwords stored in memory only (never written to disk).
 # ---------------------------------------------------------------------------
 ask_admin_creds(){
-  # Skip if already set (e.g. re-sourcing the lib)
   if [[ -n "${NSX_PASS:-}" ]]; then
     log "Admin credentials already loaded, skipping prompt."
     return 0
   fi
   read -rp  "Admin username [admin]: " NSX_USER
   NSX_USER="${NSX_USER:-admin}"
-  # IFS= read -r preserves every character including backslashes and special chars
   IFS= read -rsp "Admin password (all special characters accepted): " NSX_PASS; echo
   export NSX_USER NSX_PASS
   log "Credentials collected for user '${NSX_USER}'. Will be reused for all nodes."
@@ -119,63 +112,44 @@ clear_creds(){
   log "Credentials cleared from memory."
 }
 
-# ---------------------------------------------------------------------------
-# SSH helper: write password to a private temp file, pass via SSHPASS env var.
-# This avoids exposing the password in process args and handles any char safely.
-# ---------------------------------------------------------------------------
-_sshpass_safe(){
-  # $1 = password variable name (NSX_PASS or ROOT_PASS)
-  # remaining args = ssh command
-  local _passvar="$1"; shift
-  local _pass="${!_passvar}"
-  local _tmpfile
-  _tmpfile="$(mktemp -t sshpass_XXXXXX)"
-  chmod 600 "${_tmpfile}"
-  # Write raw password to file — no shell interpretation
-  printf '%s' "${_pass}" > "${_tmpfile}"
-  SSHPASS="$(cat "${_tmpfile}")" sshpass -e "$@"
-  local _rc=$?
-  rm -f "${_tmpfile}"
-  return $_rc
+prompt_clear_creds(){
+  echo ""
+  read -rp "Clear credentials from memory? [S/n]: " _CLR
+  if [[ "${_CLR,,}" == "n" ]]; then
+    log "Credentials kept in session."
+  else
+    clear_creds
+  fi
 }
 
 # ---------------------------------------------------------------------------
-# SSH Functions
+# SSH Functions — always password-based via sshpass
+# SSHPASS is set immediately before each call and unset right after.
 # ---------------------------------------------------------------------------
 ssh_admin(){
   local ip="$1"; shift
-  if [[ -f "${ADMIN_KEY}" ]]; then
-    ssh -i "${ADMIN_KEY}" \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o ConnectTimeout=15 \
-        -o BatchMode=yes \
-        "admin@${ip}" "$@"
-  else
-    _sshpass_safe NSX_PASS ssh \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o ConnectTimeout=15 \
-        "${NSX_USER}@${ip}" "$@"
-  fi
+  export SSHPASS="${NSX_PASS}"
+  sshpass -e ssh \
+      -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null \
+      -o ConnectTimeout=15 \
+      "${NSX_USER}@${ip}" "$@"
+  local _rc=$?
+  unset SSHPASS
+  return $_rc
 }
 
 ssh_root(){
   local ip="$1"; shift
-  if [[ -f "${ROOT_KEY}" ]]; then
-    ssh -i "${ROOT_KEY}" \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o ConnectTimeout=15 \
-        -o BatchMode=yes \
-        "root@${ip}" "$@"
-  else
-    _sshpass_safe ROOT_PASS ssh \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o ConnectTimeout=15 \
-        "root@${ip}" "$@"
-  fi
+  export SSHPASS="${ROOT_PASS}"
+  sshpass -e ssh \
+      -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null \
+      -o ConnectTimeout=15 \
+      "root@${ip}" "$@"
+  local _rc=$?
+  unset SSHPASS
+  return $_rc
 }
 
 admin_cmd(){ local ip="$1" cmd="$2"; ssh_admin "$ip" "$cmd" 2>&1; }
