@@ -44,10 +44,12 @@ need_cmd(){
 
 # ---------------------------------------------------------------------------
 # IP Management
+# IPs live in edge_nodes.txt inside each automation's own folder.
+# Never committed. Template: edge_nodes.example
 # ---------------------------------------------------------------------------
 collect_ips(){
   if [[ -f "${EDGE_EXAMPLE}" ]]; then
-    echo "  Template: ${EDGE_EXAMPLE}"
+    echo "  Template available: ${EDGE_EXAMPLE}"
     echo "  Copy with: cp edge_nodes.example edge_nodes.txt, then edit."
     echo "  Or paste IPs directly below."
   fi
@@ -114,8 +116,8 @@ clear_creds(){
 }
 
 # ---------------------------------------------------------------------------
-# SSH helper: escreve senha em arquivo temporario privado para evitar
-# exposicao em argumentos de processo. Funciona com qualquer caractere especial.
+# SSH helper: escreve senha em arquivo temporario privado.
+# Evita exposicao em argumentos de processo. Funciona com qualquer char especial.
 # ---------------------------------------------------------------------------
 _sshpass_safe(){
   local _passvar="$1"; shift
@@ -184,14 +186,17 @@ root_cmd(){
 
 # ---------------------------------------------------------------------------
 # Root SSH Control — comandos corretos NSX-T Edge
-# Habilitar : start service ssh  +  set ssh root-login
-# Desabilitar: clear ssh root-login
-# Validar   : get service ssh
+#
+# Habilitar root login : set ssh root-login
+# Desabilitar root login: clear ssh root-login
+# Validar estado        : get service ssh
+#
+# Nota: "start service ssh" NAO e necessario — o servico SSH ja esta ativo
+# no Edge Node. Usar apenas "set ssh root-login" para liberar acesso root.
 # ---------------------------------------------------------------------------
 enable_root_ssh(){
   local ip="$1"
   log "${ip}: enabling root SSH..."
-  admin_cmd "$ip" 'start service ssh'  || true
   admin_cmd "$ip" 'set ssh root-login' || true
   admin_cmd "$ip" 'get service ssh'    || true
 }
