@@ -1,15 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v3.1
+# deploy_nsx_sb_check.sh  v3.2
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
 # USO:
 #   bash deploy_nsx_sb_check.sh [--dir /caminho/destino]
 #   curl -fsSL https://raw.githubusercontent.com/leopoldocosta/nsx-edge-automation/main/automations/support_bundle/deploy_nsx_sb_check.sh | bash
-#
-# O script gera todos os arquivos localmente e solicita os IPs dos Edge Nodes.
-# Nenhum repositório Git é necessário.
-# Autenticação: sempre por senha via sshpass (sem chaves SSH).
 # =============================================================================
 set -euo pipefail
 
@@ -27,7 +23,7 @@ mkdir -p "${AUTO_DIR}/logs" "${AUTO_DIR}/run" "${LIB_DIR}" "${DOCS_DIR}" "${EXAM
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v3.1"
+echo "  NSX Edge Automation — Support Bundle Kit  v3.2"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -62,36 +58,41 @@ session.env
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh  — v3.1
+# lib/common.sh  — v3.2
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh  — v3.1
+# lib/common.sh  — v3.2
 #
-# Lógica PRE-CHECK (v3.1) — totalmente automática, sem prompt interativo:
+# Novidades v3.2:
+#   1. CORES: boxes com título em FUNDO COLORIDO (ANSI 4x) para máximo destaque
+#        _C_BOX_TITLE        \033[44;1;37m  fundo azul  + branco brilhante  (log)
+#        _C_BOX_GREEN_TITLE  \033[42;1;37m  fundo verde + branco brilhante  (bundle recente)
+#        _C_BOX_YELLOW_TITLE \033[43;1;30m  fundo amarelo + preto           (bundle antigo)
+#      Conteúdo do box: texto branco brilhante, sem fundo.
 #
-#   check_bundle_status IP
-#     Retorna via variável global BUNDLE_STATUS:
-#       "recent"  — arquivo .tgz em file-store com mtime ≤ 7 dias  → PULAR geração
-#       "old"     — arquivo .tgz em file-store com mtime > 7 dias   → DELETAR + GERAR
-#       "none"    — nenhum arquivo encontrado                        → GERAR
-#       "inprogress" — geração já em andamento                      → PULAR
+#   2. delete_all_bundles IP
+#        Apaga TODOS os support-bundle*.tgz em file-store, independente da idade.
+#        Chamado por nsx_sb_main.sh --clean-all
 #
-#   delete_old_bundles IP
-#     Apaga arquivos support-bundle*.tgz com mtime > 7 dias em file-store.
-#     Registra cada arquivo deletado via log_warn.
+#   3. request_support_bundle IP
+#        Emite o comando 'get support-bundle' em BACKGROUND via SSH + disown.
+#        O script não trava — retorna imediatamente.
+#        Saída gravada em logs/sb_bg_<ip>_<ts>.log
+#        Acompanhe com: tail -f logs/sb_bg_*.log
 #
-#   Ao final de nsx_sb_main.sh é exibido um relatório compacto (box ciano)
-#   com 1 linha por IP: IP | status | ação | arquivo confirmado.
+# Lógica PRE-CHECK (herdada v3.1):
+#   check_bundle_status IP → BUNDLE_STATUS: recent | old | none | inprogress
+#   delete_old_bundles IP  → apaga apenas arquivos > 7 dias
 #
-# ANSI color output:
-#   log        — branco     informação geral
-#   log_ok     — verde      sucesso
-#   log_warn   — amarelo    aviso
-#   log_err    — vermelho   erro crítico
-#   log_cmd    — magenta    comando SSH enviado
-#   log_banner — ciano      cabeçalho de fase/seção
-#   Prompts    — azul bold
+# ANSI colors:
+#   log        branco
+#   log_ok     verde bold
+#   log_warn   amarelo bold
+#   log_err    vermelho bold
+#   log_cmd    magenta
+#   log_banner ciano bold
+#   prompts    azul bold
 set -euo pipefail
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -103,15 +104,22 @@ EDGE_EXAMPLE="${AUTO_DIR}/edge_nodes.example"
 
 mkdir -p "${LOG_DIR}" "${RUN_DIR}"
 
+# Cores gerais
 _C_RESET='\033[0m'
 _C_WHITE='\033[0;37m'
+_C_BRIGHT='\033[1;37m'
 _C_GREEN='\033[1;32m'
 _C_YELLOW='\033[1;33m'
 _C_RED='\033[1;31m'
 _C_CYAN='\033[1;36m'
 _C_MAGENTA='\033[0;35m'
-_C_BLUE='\033[0;34m'
 _C_BLUE_BOLD='\033[1;34m'
+
+# Box — títulos com fundo colorido
+_C_BOX_TITLE='\033[44;1;37m'         # fundo azul  + branco brilhante
+_C_BOX_GREEN_TITLE='\033[42;1;37m'   # fundo verde + branco brilhante
+_C_BOX_YELLOW_TITLE='\033[43;1;30m'  # fundo amarelo + preto
+_C_BOX_SIDE='\033[1;37m'             # borda lateral: branco brilhante
 
 _CRED_DIR="/tmp"
 [[ -d "/dev/shm" ]] && _CRED_DIR="/dev/shm"
@@ -120,9 +128,9 @@ _KNOWN_HOSTS="/tmp/.nsx_known_hosts_${UID}"
 touch "${_KNOWN_HOSTS}" 2>/dev/null && chmod 600 "${_KNOWN_HOSTS}" 2>/dev/null || true
 
 # Variáveis globais preenchidas por check_bundle_status
-BUNDLE_STATUS=""      # recent | old | none | inprogress
-BUNDLE_FILES_RECENT=""  # arquivos ≤ 7 dias
-BUNDLE_FILES_OLD=""     # arquivos > 7 dias
+BUNDLE_STATUS=""
+BUNDLE_FILES_RECENT=""
+BUNDLE_FILES_OLD=""
 
 log(){        printf "${_C_WHITE}[%s] %s${_C_RESET}\n"         "$(date '+%F %T')" "$*"; }
 log_ok(){     printf "${_C_GREEN}[%s] [OK]   %s${_C_RESET}\n"  "$(date '+%F %T')" "$*"; }
@@ -136,9 +144,7 @@ need_cmd(){
 }
 
 collect_ips(){
-  if [[ -f "${EDGE_EXAMPLE}" ]]; then
-    echo "  Template: ${EDGE_EXAMPLE}  |  cp edge_nodes.example edge_nodes.txt"
-  fi
+  [[ -f "${EDGE_EXAMPLE}" ]] && echo "  Template: ${EDGE_EXAMPLE}"
   echo ""
   printf "${_C_BLUE_BOLD}Paste Edge Node IPs, one per line. Empty line to finish:${_C_RESET}\n"
   : > "${EDGE_FILE}"
@@ -267,8 +273,19 @@ disable_root_ssh(){
 }
 
 # ---------------------------------------------------------------------------
+# _box_line WIDTH CHAR
+#   Gera uma linha de WIDTH repetições de CHAR
+# ---------------------------------------------------------------------------
+_box_line(){
+  local width="$1" char="${2:--}" out=""
+  for (( i=0; i<width; i++ )); do out+="${char}"; done
+  printf '%s' "${out}"
+}
+
+# ---------------------------------------------------------------------------
 # check_bundle_log IP
-#   Exibe última linha do support_bundle.log (box azul). Sempre 1 linha.
+#   Exibe última linha de /var/log/support_bundle.log.
+#   Título do box com fundo azul (destacado).
 #   Returns: 0=ok, 1=erro no log, 2=arquivo não encontrado
 # ---------------------------------------------------------------------------
 check_bundle_log(){
@@ -280,10 +297,12 @@ check_bundle_log(){
     log_warn "${ip}: ${log_file} não encontrado."
     return 2
   fi
+  local title=" ${ip}: ${log_file} (última linha) "
+  local width=74
   echo ""
-  printf "  ${_C_BLUE}┌─ ${ip}: ${log_file} (última linha) ──────────────────────────────${_C_RESET}\n"
-  printf "  ${_C_BLUE}│${_C_RESET}  %s\n" "${out}"
-  printf "  ${_C_BLUE}└────────────────────────────────────────────────────────────────${_C_RESET}\n"
+  printf "  ${_C_BOX_TITLE}┌─%-*s─┐${_C_RESET}\n" "$(( width - 4 ))" "${title}"
+  printf "  ${_C_BOX_SIDE}│${_C_RESET}  %s\n" "${out}"
+  printf "  ${_C_BOX_SIDE}└%s┘${_C_RESET}\n" "$(_box_line $(( width - 2 )) '─')"
   echo ""
   if grep -qiE 'error|fail|exception|abort|fatal' <<< "$out"; then
     log_warn "${ip}: problema detectado na última linha do log."; return 1
@@ -294,31 +313,22 @@ check_bundle_log(){
 
 # ---------------------------------------------------------------------------
 # check_bundle_status IP
-#   Preenche as variáveis globais:
-#     BUNDLE_STATUS        : recent | old | none | inprogress
-#     BUNDLE_FILES_RECENT  : lista de arquivos ≤ 7 dias
-#     BUNDLE_FILES_OLD     : lista de arquivos > 7 dias
-#
-#   Lógica:
-#     1. Verifica processos em andamento → inprogress
-#     2. Busca .tgz em file-store:
-#        - algum com mtime ≤ 7d  → recent  (exibe box verde)
-#        - apenas com mtime > 7d → old     (exibe box amarelo)
-#        - nenhum                → none
+#   Preenche: BUNDLE_STATUS, BUNDLE_FILES_RECENT, BUNDLE_FILES_OLD
+#   Status: recent | old | none | inprogress
+#   Boxes de resultado com fundo colorido.
 # ---------------------------------------------------------------------------
 check_bundle_status(){
   local ip="$1"
   BUNDLE_STATUS="none"
   BUNDLE_FILES_RECENT=""
   BUNDLE_FILES_OLD=""
+  local width=74
 
   log "${ip}: [PRE-CHECK] verificando status do support bundle..."
 
-  # Stage 1: em andamento?
-  local proc_out
+  local proc_out partial_out
   proc_out="$(root_cmd "$ip" \
     "ps aux 2>/dev/null | grep -iE 'support_bundle|support-bundle|napi.*bundle' | grep -v grep || true")"
-  local partial_out
   partial_out="$(root_cmd "$ip" \
     "find /var/vmware/nsx/file-store -maxdepth 1 -name 'support-bundle*' -newer /proc/1 -mmin -30 2>/dev/null || true")"
   if [[ -n "$proc_out" || -n "$partial_out" ]]; then
@@ -327,22 +337,20 @@ check_bundle_status(){
     return 0
   fi
 
-  # Stage 2: arquivos recentes (≤ 7 dias)
   BUNDLE_FILES_RECENT="$(root_cmd "$ip" \
     "find /var/vmware/nsx/file-store -maxdepth 1 -name 'support-bundle*.tgz' -mtime -7 2>/dev/null | sort || true")"
-
-  # Stage 3: arquivos antigos (> 7 dias)
   BUNDLE_FILES_OLD="$(root_cmd "$ip" \
     "find /var/vmware/nsx/file-store -maxdepth 1 -name 'support-bundle*.tgz' -mtime +7 2>/dev/null | sort || true")"
 
   if [[ -n "$BUNDLE_FILES_RECENT" ]]; then
     BUNDLE_STATUS="recent"
+    local title=" ${ip}: bundle recente confirmado em file-store (≤ 7 dias) "
     echo ""
-    printf "  ${_C_GREEN}┌─ ${ip}: bundle recente confirmado em file-store (≤ 7 dias) ──────────────────${_C_RESET}\n"
+    printf "  ${_C_BOX_GREEN_TITLE}┌─%-*s─┐${_C_RESET}\n" "$(( width - 4 ))" "${title}"
     while IFS= read -r f; do
-      printf "  ${_C_GREEN}│${_C_RESET}  %s\n" "$f"
+      printf "  ${_C_BOX_SIDE}│${_C_RESET}  %s\n" "$f"
     done <<< "$BUNDLE_FILES_RECENT"
-    printf "  ${_C_GREEN}└────────────────────────────────────────────────────────────────────────────────${_C_RESET}\n"
+    printf "  ${_C_BOX_SIDE}└%s┘${_C_RESET}\n" "$(_box_line $(( width - 2 )) '─')"
     echo ""
     log_ok "${ip}: bundle recente — geração será pulada."
     return 0
@@ -350,14 +358,15 @@ check_bundle_status(){
 
   if [[ -n "$BUNDLE_FILES_OLD" ]]; then
     BUNDLE_STATUS="old"
+    local title=" ${ip}: bundle(s) ANTIGO(S) em file-store (> 7 dias) "
     echo ""
-    printf "  ${_C_YELLOW}┌─ ${ip}: bundle(s) ANTIGO(S) encontrado(s) em file-store (> 7 dias) ────────────${_C_RESET}\n"
+    printf "  ${_C_BOX_YELLOW_TITLE}┌─%-*s─┐${_C_RESET}\n" "$(( width - 4 ))" "${title}"
     while IFS= read -r f; do
-      printf "  ${_C_YELLOW}│${_C_RESET}  %s\n" "$f"
+      printf "  ${_C_BOX_SIDE}│${_C_RESET}  %s\n" "$f"
     done <<< "$BUNDLE_FILES_OLD"
-    printf "  ${_C_YELLOW}└────────────────────────────────────────────────────────────────────────────────${_C_RESET}\n"
+    printf "  ${_C_BOX_SIDE}└%s┘${_C_RESET}\n" "$(_box_line $(( width - 2 )) '─')"
     echo ""
-    log_warn "${ip}: bundle(s) antigo(s) detectado(s) — será(ão) deletado(s) e novo será gerado."
+    log_warn "${ip}: bundle(s) antigo(s) — serão deletados e novo será gerado."
     return 0
   fi
 
@@ -367,12 +376,11 @@ check_bundle_status(){
 
 # ---------------------------------------------------------------------------
 # delete_old_bundles IP
-#   Apaga arquivos support-bundle*.tgz com mtime > 7 dias.
-#   Registra cada deleção via log_warn.
+#   Apaga apenas arquivos support-bundle*.tgz com mtime > 7 dias.
 # ---------------------------------------------------------------------------
 delete_old_bundles(){
   local ip="$1"
-  if [[ -z "$BUNDLE_FILES_OLD" ]]; then return 0; fi
+  [[ -z "$BUNDLE_FILES_OLD" ]] && return 0
   log "${ip}: deletando bundle(s) antigo(s)..."
   while IFS= read -r fpath; do
     [[ -z "$fpath" ]] && continue
@@ -385,11 +393,67 @@ delete_old_bundles(){
   done <<< "$BUNDLE_FILES_OLD"
 }
 
+# ---------------------------------------------------------------------------
+# delete_all_bundles IP
+#   Apaga TODOS os arquivos support-bundle*.tgz em file-store (qualquer idade).
+#   Usado com a flag --clean-all no nsx_sb_main.sh.
+# ---------------------------------------------------------------------------
+delete_all_bundles(){
+  local ip="$1"
+  log "${ip}: buscando TODOS os bundles para limpeza total..."
+  local all_files
+  all_files="$(root_cmd "$ip" \
+    "find /var/vmware/nsx/file-store -maxdepth 1 -name 'support-bundle*.tgz' 2>/dev/null | sort || true")"
+  if [[ -z "$all_files" ]]; then
+    log "${ip}: nenhum bundle encontrado para deletar."
+    return 0
+  fi
+  while IFS= read -r fpath; do
+    [[ -z "$fpath" ]] && continue
+    log_cmd "${ip}: rm -f ${fpath}"
+    if root_cmd "$ip" "rm -f '${fpath}' 2>/dev/null"; then
+      log_warn "${ip}: deletado — ${fpath}"
+    else
+      log_err "${ip}: falha ao deletar — ${fpath}"
+    fi
+  done <<< "$all_files"
+  log_ok "${ip}: limpeza total concluída."
+}
+
+# ---------------------------------------------------------------------------
+# request_support_bundle IP
+#   Emite o comando 'get support-bundle' via SSH em BACKGROUND.
+#   O script retorna imediatamente — sem travar.
+#   Saída gravada em: logs/sb_bg_<ip>_<ts>.log
+#   Acompanhe com:    tail -f logs/sb_bg_*.log
+# ---------------------------------------------------------------------------
 request_support_bundle(){
   local ip="$1"
   local fname="sb_${ip//./_}_$(date +%Y%m%d_%H%M%S).tgz"
-  log_cmd "${ip}: get support-bundle file ${fname} log-age 1"
-  admin_cmd_tty "$ip" "get support-bundle file ${fname} log-age 1" || true
+  local logfile="${LOG_DIR}/sb_bg_${ip//./_}_$(date +%Y%m%d_%H%M%S).log"
+
+  log_cmd "${ip}: [BACKGROUND] get support-bundle file ${fname} log-age 1"
+  log "${ip}: comando disparado em background — script não aguarda conclusão."
+  log "${ip}: saída em: ${logfile}"
+
+  export SSHPASS="${NSX_PASS}"
+  (
+    sshpass -e ssh \
+      -o StrictHostKeyChecking=accept-new \
+      -o UserKnownHostsFile="${_KNOWN_HOSTS}" \
+      -o ConnectTimeout=15 \
+      -o ServerAliveInterval=30 \
+      -o ServerAliveCountMax=120 \
+      "${NSX_USER}@${ip}" \
+      "get support-bundle file ${fname} log-age 1" \
+      > "${logfile}" 2>&1
+    echo "[$(date '+%F %T')] [OK] Bundle concluído: ${fname}" >> "${logfile}"
+  ) &
+  disown $!
+  unset SSHPASS
+
+  log_ok "${ip}: solicitação de bundle disparada em background."
+  log "${ip}: acompanhe com: tail -f ${logfile}"
 }
 COMMON
 chmod +x "${LIB_DIR}/common.sh"
@@ -466,19 +530,24 @@ TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_main.sh  — v3.1
+# nsx_sb_main.sh  — v3.2
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v3.1
+# nsx_sb_main.sh  — v3.2
 #
-# Fluxo automático por node:
-#   bundle recente (≤ 7d)  → pular geração
-#   bundle antigo  (> 7d)  → deletar antigos + gerar novo
-#   nenhum bundle          → gerar novo
+# Uso:
+#   ./nsx_sb_main.sh              # fluxo padrão
+#   ./nsx_sb_main.sh --clean-all  # apaga TODOS os bundles antes de gerar
+#
+# Fluxo automático por node (sem --clean-all):
+#   bundle recente (≤ 7d)  → pular
+#   bundle antigo  (> 7d)  → deletar antigos + gerar novo (background)
+#   nenhum bundle          → gerar novo (background)
 #   geração em andamento   → pular
 #
-# Exibe relatório compacto ao final com 1 linha por node.
+# A geração é assíncrona — o script NÃO TRAVA.
+# Acompanhe: tail -f logs/sb_bg_*.log
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -487,76 +556,81 @@ source "${SCRIPT_DIR}/../../lib/common.sh"
 need_cmd ssh; need_cmd sshpass
 load_ips; ask_admin_creds; ask_root_creds
 
+CLEAN_ALL=false
+[[ "${1:-}" == "--clean-all" ]] && CLEAN_ALL=true
+
 RUN_LOG="${LOG_DIR}/sb_run_$(date +%Y%m%d_%H%M%S).log"
 STATUS_CSV="${LOG_DIR}/sb_status_$(date +%Y%m%d_%H%M%S).csv"
 echo 'ip,phase,status,details,timestamp' > "$STATUS_CSV"
 
-# Array para relatório final: cada entrada = "IP|STATUS|AÇÃO|ARQUIVO"
 declare -a REPORT_LINES=()
+
+# ---- CLEAN-ALL (opcional) ----
+if [[ "$CLEAN_ALL" == true ]]; then
+  log_banner "CLEAN-ALL: Apagando TODOS os bundles existentes"
+  for ip in "${EDGE_IPS[@]}"; do
+    enable_root_ssh "$ip"
+    delete_all_bundles "$ip"
+    printf '%s,clean_all,deleted_all,ok,%s\n' "$ip" "$(date +%F_%T)" \
+      | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+  done
+fi
 
 # ---- PRE-CHECK ----
 log_banner "PRE-CHECK: Verificando bundles existentes"
 
 for ip in "${EDGE_IPS[@]}"; do
   log "${ip}: iniciando PRE-CHECK..."
-  enable_root_ssh "$ip"
+  [[ "$CLEAN_ALL" == false ]] && enable_root_ssh "$ip"
 
-  # Lê última linha do log
   check_bundle_log "$ip" || true
-
-  # Determina status do bundle
   check_bundle_status "$ip"
 
   printf '%s,precheck,bundle_status,%s,%s\n' "$ip" "$BUNDLE_STATUS" "$(date +%F_%T)" \
     | tee -a "$RUN_LOG" >> "$STATUS_CSV"
 
   case "$BUNDLE_STATUS" in
-
     recent)
       REPORT_LINES+=("${ip}|RECENTE (≤7d)|PULADO|${BUNDLE_FILES_RECENT}")
       ;;
-
     old)
       delete_old_bundles "$ip"
-      printf '%s,precheck,deleted_old_bundles,ok,%s\n' "$ip" "$(date +%F_%T)" \
+      printf '%s,precheck,deleted_old,ok,%s\n' "$ip" "$(date +%F_%T)" \
         | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-      REPORT_LINES+=("${ip}|ANTIGO (>7d)|DELETADO + GERANDO|${BUNDLE_FILES_OLD}")
+      REPORT_LINES+=("${ip}|ANTIGO (>7d)|DEL+GERANDO|${BUNDLE_FILES_OLD}")
       ;;
-
     none)
       REPORT_LINES+=("${ip}|NENHUM|GERANDO|—")
       ;;
-
     inprogress)
       REPORT_LINES+=("${ip}|EM ANDAMENTO|PULADO|—")
       ;;
   esac
 done
 
-# ---- PHASE 1: Request Support Bundle ----
-log_banner "PHASE 1: Support Bundle Request"
+# ---- PHASE 1: Request Support Bundle (background) ----
+log_banner "PHASE 1: Support Bundle Request (background)"
 
 for ip in "${EDGE_IPS[@]}"; do
-  # Recupera decisão do precheck
-  local_status=""
+  local_acao=""
   for entry in "${REPORT_LINES[@]}"; do
     if [[ "${entry%%|*}" == "$ip" ]]; then
-      local_status="$(echo "$entry" | cut -d'|' -f3)"
+      local_acao="$(echo "$entry" | cut -d'|' -f3)"
       break
     fi
   done
 
-  if [[ "$local_status" == "PULADO" ]]; then
+  if [[ "$local_acao" == "PULADO" ]]; then
     log "${ip}: pulando solicitação de bundle."
     continue
   fi
 
   request_support_bundle "$ip"
-  printf '%s,phase1,sb_requested,ok,%s\n' "$ip" "$(date +%F_%T)" \
+  printf '%s,phase1,sb_requested_bg,ok,%s\n' "$ip" "$(date +%F_%T)" \
     | tee -a "$RUN_LOG" >> "$STATUS_CSV"
 done
 
-log_ok "Phase 1 done."
+log_ok "Phase 1 done — bundles disparados em background."
 
 # ---- FINAL: Disable root SSH ----
 log_banner "FINAL: Disabling root SSH"
@@ -575,7 +649,6 @@ printf "${_C_CYAN}║ %-17s ║ %-16s ║ %-16s ║ %-18s ║${_C_RESET}\n" "NOD
 printf "${_C_CYAN}╠═══════════════════╬══════════════════╬══════════════════╬════════════════════╣${_C_RESET}\n"
 for entry in "${REPORT_LINES[@]}"; do
   IFS='|' read -r r_ip r_status r_acao r_arquivo <<< "$entry"
-  # Trunca arquivo para exibição (pega só o basename)
   r_arq_short="$(basename "${r_arquivo}" 2>/dev/null || echo "${r_arquivo}")"
   [[ ${#r_arq_short} -gt 18 ]] && r_arq_short="${r_arq_short:0:15}..."
   printf "${_C_CYAN}║${_C_RESET} %-17s ${_C_CYAN}║${_C_RESET} %-16s ${_C_CYAN}║${_C_RESET} %-16s ${_C_CYAN}║${_C_RESET} %-18s ${_C_CYAN}║${_C_RESET}\n" \
@@ -583,6 +656,7 @@ for entry in "${REPORT_LINES[@]}"; do
 done
 printf "${_C_CYAN}╚═══════════════════╩══════════════════╩══════════════════╩════════════════════╝${_C_RESET}\n"
 echo ""
+log "Para acompanhar a geração: tail -f ${LOG_DIR}/sb_bg_*.log"
 log_ok "Status CSV: ${STATUS_CSV}"
 
 prompt_clear_creds
@@ -672,24 +746,35 @@ chmod +x "${AUTO_DIR}/nsx_ssh_cli.sh"
 # MANUAL.md
 # ---------------------------------------------------------------------------
 cat > "${DOCS_DIR}/MANUAL.md" <<'MANUALDOC'
-# NSX Edge Automation — Manual de Uso  v3.1
+# NSX Edge Automation — Manual de Uso  v3.2
 
-## Fluxo automático de Support Bundle (v3.1)
+## Fluxo de Support Bundle (v3.2)
 
 | Situação detectada | Ação automática |
 |---|---|
-| Bundle ≤ 7 dias em file-store | **Pula** — bundle ainda válido |
-| Bundle > 7 dias em file-store | **Deleta** antigos + **gera** novo |
-| Nenhum bundle encontrado | **Gera** novo |
-| Geração em andamento | **Pula** — aguarda conclusão externa |
+| Bundle ≤ 7 dias em file-store | **Pula** — box fundo verde |
+| Bundle > 7 dias em file-store | **Deleta** antigos + **gera** novo (background) |
+| Nenhum bundle encontrado | **Gera** novo (background) |
+| Geração em andamento | **Pula** |
 
-Não há prompt interativo de confirmação. O script decide automaticamente.
-Ao final, exibe um **relatório compacto** (tabela ciano) com 1 linha por node.
+A geração é **assíncrona** — o script não trava.
+Acompanhe com: `tail -f logs/sb_bg_*.log`
 
-## Pré-requisitos
+## Opção --clean-all
 
-- `sshpass` instalado
-- `edge_nodes.txt` com IPs dos Edge Nodes
+```bash
+./nsx_sb_main.sh --clean-all
+```
+
+Apaga **TODOS** os support-bundle*.tgz de todos os nodes antes de gerar novos.
+
+## Cores nos boxes (v3.2)
+
+| Box | Fundo | Conteúdo |
+|---|---|---|
+| Última linha do log | Azul | `/var/log/support_bundle.log` |
+| Bundle recente | Verde | Arquivo confirmado (≤ 7 dias) |
+| Bundle antigo | Amarelo | Arquivo expirado (> 7 dias) |
 
 ## Deploy
 
@@ -701,22 +786,10 @@ curl -fsSL https://raw.githubusercontent.com/leopoldocosta/nsx-edge-automation/m
 
 ```bash
 cd ~/nsx-edge-automation/automations/support_bundle
-./test_connections.sh   # valida acesso
-./nsx_sb_main.sh        # coleta support bundle
+./test_connections.sh
+./nsx_sb_main.sh
+./nsx_sb_main.sh --clean-all
 ```
-
-## Cores no terminal
-
-| Cor | Significado |
-|---|---|
-| Branco | Info geral |
-| Verde | Sucesso / bundle recente |
-| Amarelo | Aviso / bundle antigo |
-| Vermelho | Erro |
-| Magenta | Comando SSH enviado |
-| Ciano | Cabeçalhos e relatório final |
-| Azul | Box de log / bordas |
-| Azul bold | Prompts interativos |
 MANUALDOC
 
 cat > "${EXAMPLES_DIR}/ip_list_example.txt" <<'IPEX'
@@ -734,21 +807,24 @@ fi
 
 echo ""
 echo "================================================================"
-echo "  Deploy concluído! v3.1"
+echo "  Deploy concluído! v3.2"
 echo "================================================================"
 echo ""
-echo "  Novidades v3.1:"
-echo "    - Fluxo totalmente automático, sem prompt interativo:"
-echo "      bundle ≤ 7d → pular | bundle > 7d → deletar + gerar | nenhum → gerar"
-echo "    - delete_old_bundles(): apaga .tgz com mtime > 7 dias via root SSH"
-echo "    - check_bundle_status(): classifica em recent/old/none/inprogress"
-echo "    - Relatório compacto ao final: tabela ciano com 1 linha por node"
-echo "      colunas: NODE | STATUS | AÇÃO | ARQUIVO"
+echo "  Novidades v3.2:"
+echo "    1. CORES: boxes com FUNDO COLORIDO no título:"
+echo "         Azul   (fundo) — última linha do support_bundle.log"
+echo "         Verde  (fundo) — bundle recente confirmado (≤ 7 dias)"
+echo "         Amarelo(fundo) — bundle antigo detectado (> 7 dias)"
+echo "    2. delete_all_bundles(): apaga TODOS os bundles (qualquer idade)"
+echo "         Uso: ./nsx_sb_main.sh --clean-all"
+echo "    3. request_support_bundle(): BACKGROUND — não trava mais!"
+echo "         Acompanhe: tail -f logs/sb_bg_<ip>_<ts>.log"
 echo ""
-echo "  Novidades v3.0:"
-echo "    - Evidência Stage 1 em 2 boxes (azul: última linha log, verde: arquivo .tgz)"
+echo "  Novidades v3.1:"
+echo "    - Fluxo automático sem prompt | relatório compacto final"
 echo ""
 echo "Próximos passos:"
 echo "  1. cd ${AUTO_DIR} && ./test_connections.sh"
 echo "  2. cd ${AUTO_DIR} && ./nsx_sb_main.sh"
+echo "     ou: ./nsx_sb_main.sh --clean-all"
 echo ""
