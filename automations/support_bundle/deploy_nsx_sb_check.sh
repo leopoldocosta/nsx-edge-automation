@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v3.4
+# deploy_nsx_sb_check.sh  v3.5
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
 # USO:
@@ -23,7 +23,7 @@ mkdir -p "${AUTO_DIR}/logs" "${AUTO_DIR}/run" "${LIB_DIR}" "${DOCS_DIR}" "${EXAM
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v3.4"
+echo "  NSX Edge Automation — Support Bundle Kit  v3.5"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -58,28 +58,30 @@ session.env
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh  — v3.4
+# lib/common.sh  — v3.5
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh  — v3.4
+# lib/common.sh  — v3.5
 #
-# CORREÇÃO PRINCIPAL v3.4:
-#   O root_cmd usa 2>/dev/null. No NSX Photon OS o find pode falhar
-#   silenciosamente (AppArmor, owner www-data no diretório, SSH ainda
-#   inicializando), retornando vazio mesmo com arquivos presentes.
+# CORREÇÃO v3.5 — padrão de detecção de bundles ampliado:
 #
-#   Substitui find por ls + awk em check_bundle_status:
-#     - ls -1 é muito mais simples e robusto no Photon OS
-#     - root tem permissão de leitura nos arquivos (rw-r----- root www-data)
-#     - stderr SEMPRE exposto (root_cmd_tty) nos comandos de diagnóstico
-#     - A data de modificação é obtida via stat (epoch) para calcular idade
+#   Antes o grep usava apenas 'support-bundle.*\.tgz', não detectando:
+#     - sb_172_18_214_17_20260514_172052.tgz   (prefixo sb_)
+#     - support_bundle_20220216_0132.tgz        (prefixo support_bundle_ com underscore)
+#     - arquivos .tgz criados manualmente com qualquer nome
 #
-# Herdado v3.3:
+#   Novo padrão em _BUNDLE_GREP:
+#     Arquivo começa com support-bundle, support_bundle, sb_  OU termina com .tgz
+#     Exceto arquivos que claramente não são bundles (flow-cache, backup_restore, etc.)
+#     A abordagem pragmática: qualquer .tgz no file-store É um bundle.
+#
+# Herdado v3.4:
+#   - ls+grep em vez de find (robusto no NSX Photon OS)
+#   - root_cmd_tty expõe stderr
+#   - _bundle_age_days via stat epoch
 #   - enable_root_ssh inclui sleep 3
-#   - list_bundle_dir: ls -lh antes de qualquer consulta
-#   - Boxes com fundo colorido (ANSI 4x)
-#   - delete_all_bundles | request_support_bundle background
+#   - list_bundle_dir: ls -lh completo antes de qualquer consulta
 set -euo pipefail
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -113,6 +115,17 @@ touch "${_KNOWN_HOSTS}" 2>/dev/null && chmod 600 "${_KNOWN_HOSTS}" 2>/dev/null |
 BUNDLE_STATUS=""
 BUNDLE_FILES_RECENT=""
 BUNDLE_FILES_OLD=""
+
+# ---------------------------------------------------------------------------
+# _BUNDLE_GREP — padrão ERE para identificar arquivos de support bundle
+#
+# Detecta qualquer um dos seguintes:
+#   - começa com support-bundle  (ex: support-bundle-172-18-214-18-20260514.tgz)
+#   - começa com support_bundle  (ex: support_bundle_20220216_0132.tgz)
+#   - começa com sb_             (ex: sb_172_18_214_17_20260514_172052.tgz)
+#   - termina com .tgz           (qualquer .tgz criado manualmente no diretório)
+# ---------------------------------------------------------------------------
+_BUNDLE_GREP='(^support[-_]bundle|^sb_).*\.tgz$|\.tgz$'
 
 log(){        printf "${_C_WHITE}[%s] %s${_C_RESET}\n"         "$(date '+%F %T')" "$*"; }
 log_ok(){     printf "${_C_GREEN}[%s] [OK]   %s${_C_RESET}\n"  "$(date '+%F %T')" "$*"; }
@@ -290,7 +303,6 @@ check_bundle_log(){
 # ---------------------------------------------------------------------------
 # list_bundle_dir IP
 #   Imprime ls -lh /var/vmware/nsx/file-store/ completo via root SSH.
-#   Usa root_cmd_tty para expor qualquer erro de stderr.
 # ---------------------------------------------------------------------------
 list_bundle_dir(){
   local ip="$1"
@@ -298,9 +310,7 @@ list_bundle_dir(){
   local title=" ${ip}: ls -lh ${dir}/ "
   local width=74
   local out
-  # root_cmd_tty expõe stderr — qualquer falha fica visível
   out="$(root_cmd_tty "$ip" "ls -lh ${dir}/")"
-  local ls_rc=$?
   echo ""
   printf "  ${_C_BOX_TITLE}┌─%-*s─┐${_C_RESET}\n" "$(( width - 4 ))" "${title}"
   if [[ -z "${out}" ]]; then
@@ -316,19 +326,17 @@ list_bundle_dir(){
 
 # ---------------------------------------------------------------------------
 # _bundle_age_days IP FILEPATH
-#   Retorna a idade do arquivo em dias (inteiro) via stat no node remoto.
-#   Usa epoch para cálculo exato, independente do locale.
+#   Retorna a idade do arquivo em dias (inteiro) via stat epoch no node remoto.
 # ---------------------------------------------------------------------------
 _bundle_age_days(){
   local ip="$1" fpath="$2"
   local now_epoch file_epoch age
-  # stat -c %Y = mtime em epoch (Photon OS / GNU coreutils)
   file_epoch="$(root_cmd_tty "$ip" "stat -c '%Y' '${fpath}' 2>/dev/null || echo 0")"
   now_epoch="$(root_cmd_tty "$ip" "date +%s")"
   file_epoch="$(echo "${file_epoch}" | tr -cd '0-9')"
   now_epoch="$(echo "${now_epoch}" | tr -cd '0-9')"
   if [[ -z "$file_epoch" || "$file_epoch" == "0" || -z "$now_epoch" ]]; then
-    echo 999  # sem info = trata como antigo
+    echo 999
     return
   fi
   age=$(( (now_epoch - file_epoch) / 86400 ))
@@ -336,16 +344,29 @@ _bundle_age_days(){
 }
 
 # ---------------------------------------------------------------------------
+# _list_bundles IP
+#   Lista arquivos de support bundle em /var/vmware/nsx/file-store usando
+#   ls -1 com grep ERE ampliado (_BUNDLE_GREP).
+#   Detecta: support-bundle*, support_bundle*, sb_*, e qualquer *.tgz.
+#   Retorna os nomes de arquivo (sem path), um por linha.
+# ---------------------------------------------------------------------------
+_list_bundles(){
+  local ip="$1"
+  local dir="/var/vmware/nsx/file-store"
+  root_cmd_tty "$ip" "ls -1 ${dir}/ 2>/dev/null | grep -E '${_BUNDLE_GREP}' || true"
+}
+
+# ---------------------------------------------------------------------------
 # check_bundle_status IP
-#   Usa ls + grep em vez de find para listar support-bundle*.tgz.
-#   find no NSX Photon OS falha silenciosamente por causa de:
-#     - diretório dono www-data com sticky bit
-#     - root SSH ainda estabilizando quando find é chamado
-#     - AppArmor / perfil de segurança do NSX
-#   ls é mais simples, já funciona e não tem esses problemas.
-#
 #   Preenche: BUNDLE_STATUS, BUNDLE_FILES_RECENT, BUNDLE_FILES_OLD
 #   Status: recent | old | none | inprogress
+#
+#   Com múltiplos bundles:
+#     - Se qualquer um for recente (≤7d)  → status=recent (pula geração)
+#     - Se todos forem antigos (>7d)      → status=old    (deleta + gera)
+#     - Mix recente+antigo                → status=recent (mantém recentes,
+#                                           BUNDLE_FILES_OLD preenchido para
+#                                           limpeza opcional via --clean-old)
 # ---------------------------------------------------------------------------
 check_bundle_status(){
   local ip="$1"
@@ -357,10 +378,10 @@ check_bundle_status(){
 
   log "${ip}: [PRE-CHECK] verificando status do support bundle..."
 
-  # Passo 0: listar diretório completo (visibilidade + diagnóstico)
+  # Passo 0: listar diretório completo
   list_bundle_dir "$ip"
 
-  # Passo 1: verificar processo de geração em andamento
+  # Passo 1: processo de geração em andamento?
   local proc_out
   proc_out="$(root_cmd_tty "$ip" \
     "ps aux 2>/dev/null | grep -iE 'support_bundle|support-bundle|napi.*bundle' | grep -v grep || true")"
@@ -370,25 +391,27 @@ check_bundle_status(){
     return 0
   fi
 
-  # Passo 2: listar arquivos support-bundle*.tgz via ls + grep
-  #   root_cmd_tty expõe stderr; grep retorna 1 se vazio (|| true para não abortar)
+  # Passo 2: listar bundles com padrão ampliado
   local all_bundles
-  all_bundles="$(root_cmd_tty "$ip" \
-    "ls -1 ${dir}/ 2>&1 | grep 'support-bundle.*\.tgz' || true")"
-  log "${ip}: [ls+grep support-bundle*.tgz] resultado bruto: '${all_bundles:-<vazio>}'"
+  all_bundles="$(_list_bundles "$ip")"
+  log "${ip}: [bundles detectados] resultado bruto: '${all_bundles:-<vazio>}'"
 
   if [[ -z "$all_bundles" ]]; then
     log "${ip}: nenhum bundle encontrado em file-store — será gerado."
     return 0
   fi
 
-  # Passo 3: classificar cada arquivo por idade via stat
+  local bundle_count
+  bundle_count="$(echo "$all_bundles" | grep -c '.' || true)"
+  log "${ip}: ${bundle_count} bundle(s) encontrado(s)."
+
+  # Passo 3: classificar por idade via stat
   local f age fpath
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     fpath="${dir}/${f}"
     age="$(_bundle_age_days "$ip" "$fpath")"
-    log "${ip}: arquivo '${f}' tem ${age} dia(s)."
+    log "${ip}: arquivo '${f}' → ${age} dia(s)."
     if [[ "$age" -le 7 ]]; then
       BUNDLE_FILES_RECENT+="${fpath}"$'\n'
     else
@@ -396,41 +419,56 @@ check_bundle_status(){
     fi
   done <<< "$all_bundles"
 
-  # Remove trailing newlines
   BUNDLE_FILES_RECENT="${BUNDLE_FILES_RECENT%$'\n'}"
   BUNDLE_FILES_OLD="${BUNDLE_FILES_OLD%$'\n'}"
 
+  # Decide status
   if [[ -n "$BUNDLE_FILES_RECENT" ]]; then
     BUNDLE_STATUS="recent"
-    local title=" ${ip}: bundle recente confirmado em file-store (≤ 7 dias) "
+    local rec_count old_count
+    rec_count="$(echo "$BUNDLE_FILES_RECENT" | grep -c '.' || true)"
+    old_count=0
+    [[ -n "$BUNDLE_FILES_OLD" ]] && old_count="$(echo "$BUNDLE_FILES_OLD" | grep -c '.' || true)"
+    local title=" ${ip}: ${rec_count} bundle(s) recente(s) ≤7d | ${old_count} antigo(s) >7d "
     echo ""
     printf "  ${_C_BOX_GREEN_TITLE}┌─%-*s─┐${_C_RESET}\n" "$(( width - 4 ))" "${title}"
     while IFS= read -r fline; do
       [[ -z "$fline" ]] && continue
-      printf "  ${_C_BOX_SIDE}│${_C_RESET}  %s\n" "$fline"
+      printf "  ${_C_BOX_SIDE}│${_C_RESET}  ✔  %s\n" "$(basename "$fline")"
     done <<< "$BUNDLE_FILES_RECENT"
+    if [[ -n "$BUNDLE_FILES_OLD" ]]; then
+      while IFS= read -r fline; do
+        [[ -z "$fline" ]] && continue
+        printf "  ${_C_BOX_SIDE}│${_C_RESET}  ⚠  %s  [ANTIGO]\'\n" "$(basename "$fline")"
+      done <<< "$BUNDLE_FILES_OLD"
+    fi
     printf "  ${_C_BOX_SIDE}└%s┘${_C_RESET}\n" "$(_box_line $(( width - 2 )) '─')"
     echo ""
-    log_ok "${ip}: bundle recente — geração será pulada."
+    log_ok "${ip}: bundle recente presente — geração será pulada."
+    if [[ -n "$BUNDLE_FILES_OLD" ]]; then
+      log_warn "${ip}: existem também bundle(s) antigo(s) — use --clean-old para remover."
+    fi
     return 0
   fi
 
   if [[ -n "$BUNDLE_FILES_OLD" ]]; then
     BUNDLE_STATUS="old"
-    local title=" ${ip}: bundle(s) ANTIGO(S) em file-store (> 7 dias) "
+    local old_count
+    old_count="$(echo "$BUNDLE_FILES_OLD" | grep -c '.' || true)"
+    local title=" ${ip}: ${old_count} bundle(s) ANTIGO(S) >7d — serão deletados "
     echo ""
     printf "  ${_C_BOX_YELLOW_TITLE}┌─%-*s─┐${_C_RESET}\n" "$(( width - 4 ))" "${title}"
     while IFS= read -r fline; do
       [[ -z "$fline" ]] && continue
-      printf "  ${_C_BOX_SIDE}│${_C_RESET}  %s\n" "$fline"
+      printf "  ${_C_BOX_SIDE}│${_C_RESET}  ⚠  %s\n" "$(basename "$fline")"
     done <<< "$BUNDLE_FILES_OLD"
     printf "  ${_C_BOX_SIDE}└%s┘${_C_RESET}\n" "$(_box_line $(( width - 2 )) '─')"
     echo ""
-    log_warn "${ip}: bundle(s) antigo(s) — serão deletados e novo será gerado."
+    log_warn "${ip}: todos os bundles são antigos — serão deletados e novo será gerado."
     return 0
   fi
 
-  log "${ip}: nenhum bundle encontrado em file-store — será gerado."
+  log "${ip}: nenhum bundle encontrado — será gerado."
   return 0
 }
 
@@ -453,19 +491,21 @@ delete_old_bundles(){
 }
 
 # ---------------------------------------------------------------------------
-# delete_all_bundles IP
+# delete_all_bundles IP  (--clean-all)
 # ---------------------------------------------------------------------------
 delete_all_bundles(){
   local ip="$1"
   local dir="/var/vmware/nsx/file-store"
   log "${ip}: buscando TODOS os bundles para limpeza total..."
   local all_files
-  all_files="$(root_cmd_tty "$ip" \
-    "ls -1 ${dir}/ 2>&1 | grep 'support-bundle.*\.tgz' || true")"
+  all_files="$(_list_bundles "$ip")"
   if [[ -z "$all_files" ]]; then
     log "${ip}: nenhum bundle encontrado para deletar."
     return 0
   fi
+  local count
+  count="$(echo "$all_files" | grep -c '.' || true)"
+  log "${ip}: ${count} bundle(s) para deletar."
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     local fpath="${dir}/${f}"
@@ -586,11 +626,11 @@ TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_main.sh  — v3.4
+# nsx_sb_main.sh  — v3.5
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v3.4
+# nsx_sb_main.sh  — v3.5
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -785,33 +825,36 @@ chmod +x "${AUTO_DIR}/nsx_ssh_cli.sh"
 # MANUAL.md
 # ---------------------------------------------------------------------------
 cat > "${DOCS_DIR}/MANUAL.md" <<'MANUALDOC'
-# NSX Edge Automation — Manual de Uso  v3.4
+# NSX Edge Automation — Manual de Uso  v3.5
 
-## Correções v3.4
+## Correções v3.5
 
-| Problema raiz | Correção |
+| Problema | Correção |
 |---|---|
-| `find` falha silenciosamente no NSX Photon OS (diretório dono `www-data`, AppArmor, SSH ainda inicializando) | Substituído por `ls -1 + grep` em `check_bundle_status` e `delete_all_bundles` |
-| `root_cmd` suprime stderr com `2>/dev/null` | Todos os comandos de diagnóstico usam `root_cmd_tty` (stderr visível) |
-| `find -mtime` depende de comportamento de filesystem | Idade calculada via `stat -c %Y` (epoch) com aritmética explícita |
+| grep `support-bundle.*\.tgz` não detectava `sb_*` nem `support_bundle_*` | Novo padrão `_BUNDLE_GREP` via ERE: `(^support[-_]bundle\|^sb_).*\.tgz$\|\.tgz$` |
+| Múltiplos bundles no mesmo diretório não eram todos reportados | `check_bundle_status` itera sobre cada arquivo, classifica e exibe contagem |
+| `delete_all_bundles` usava grep restrito | Agora usa `_list_bundles()` com o mesmo `_BUNDLE_GREP` ampliado |
 
-## Fluxo de Support Bundle (v3.4)
+## Padrão de detecção de bundles (`_BUNDLE_GREP`)
+
+| Nome do arquivo | Detectado? |
+|---|---|
+| `support-bundle-172-18-214-18-20260514.tgz` | ✔ prefixo `support-bundle` |
+| `support_bundle_20220216_0132.tgz` | ✔ prefixo `support_bundle` |
+| `sb_172_18_214_17_20260514_172052.tgz` | ✔ prefixo `sb_` |
+| `qualquer-coisa.tgz` | ✔ terminador `.tgz` |
+| `flow-cache-dump-0.gz` | ✗ não é `.tgz` |
+| `backup_restore_helper.py` | ✗ não é `.tgz` |
+
+## Fluxo de Support Bundle (v3.5)
 
 | Situação detectada | Ação automática |
 |---|---|
-| Bundle ≤ 7 dias em file-store | **Pula** — box fundo verde |
-| Bundle > 7 dias em file-store | **Deleta** antigos + **gera** novo (background) |
-| Nenhum bundle encontrado | **Gera** novo (background) |
+| Bundle(s) ≤ 7 dias | **Pula** geração — exibe contagem de recentes e antigos |
+| Apenas bundles > 7 dias | **Deleta** + gera novo (background) |
+| Mix recente + antigo | **Pula** — avisa sobre antigos (use `--clean-all`) |
+| Nenhum bundle | **Gera** novo (background) |
 | Geração em andamento | **Pula** |
-
-A geração é **assíncrona** — o script não trava.
-Acompanhe com: `tail -f logs/sb_bg_*.log`
-
-## Opção --clean-all
-
-```bash
-./nsx_sb_main.sh --clean-all
-```
 
 ## Deploy
 
@@ -844,14 +887,13 @@ fi
 
 echo ""
 echo "================================================================"
-echo "  Deploy concluído! v3.4"
+echo "  Deploy concluído! v3.5"
 echo "================================================================"
 echo ""
-echo "  Correção principal v3.4:"
-echo "    - find substituido por ls+grep (robusto no NSX Photon OS)"
-echo "    - Todos os cmds de diagnóstico usam root_cmd_tty (stderr visível)"
-echo "    - Idade do arquivo via stat epoch (exato, sem depender do find)"
-echo "    - Nova func: _bundle_age_days IP FPATH"
+echo "  Correção principal v3.5:"
+echo "    _BUNDLE_GREP detecta: support-bundle*, support_bundle*, sb_*, *.tgz"
+echo "    Múltiplos bundles: exibe contagem e classifica por idade"
+echo "    Mix recente+antigo: mantém recentes, avisa sobre antigos"
 echo ""
 echo "Próximos passos:"
 echo "  1. cd ${AUTO_DIR} && ./test_connections.sh"
