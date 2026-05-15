@@ -98,7 +98,9 @@ cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #
 # PRE-CHECK bundle detection (v2.7) — 3-stage logic:
 #   Stage 1: check_bundle_log_recent — if support_bundle.log shows a bundle
-#            generated within the last 7 days, treat as existing (return 0).
+#            generated within the last 7 days, confirm evidence by checking
+#            that a support-bundle*.tgz file really exists in file-store and
+#            was created in the last 7 days.
 #   Stage 2: check_existing_bundle   — look for .tgz files in file-store or
 #            via 'get files' (admin CLI).
 #   Stage 3: check_bundle_in_progress — detect an active generation process
@@ -149,6 +151,9 @@ _CRED_FILE="${_CRED_DIR}/.nsx_session_${UID}"
 
 _KNOWN_HOSTS="/tmp/.nsx_known_hosts_${UID}"
 touch "${_KNOWN_HOSTS}" 2>/dev/null && chmod 600 "${_KNOWN_HOSTS}" 2>/dev/null || true
+
+# Guarda evidência validada do Stage 1 para exibição no prompt
+STAGE1_BUNDLE_FILES=""
 
 # ---------------------------------------------------------------------------
 # Logging — color-coded
@@ -409,12 +414,13 @@ check_bundle_log(){
 # ---------------------------------------------------------------------------
 # check_bundle_log_recent IP
 #   Stage 1 of PRE-CHECK.
-#   Returns: 0=recent found, 1=not found, 2=log absent
+#   Returns: 0=recent found with file evidence, 1=not found, 2=log absent
 # ---------------------------------------------------------------------------
 check_bundle_log_recent(){
   local ip="$1"
   local log_file="/var/log/support_bundle.log"
 
+  STAGE1_BUNDLE_FILES=""
   log "${ip}: [PRE-CHECK Stage 1] verificando geração recente em ${log_file}..."
 
   local out
@@ -438,13 +444,32 @@ check_bundle_log_recent(){
   now_epoch="$(date +%s)"
   cutoff_epoch=$(( now_epoch - 7 * 86400 ))
 
-  if [[ "$log_epoch" -ge "$cutoff_epoch" ]]; then
-    log_ok "${ip}: log indica bundle gerado em ${last_date} (dentro dos últimos 7 dias) — considerando como existente."
-    return 0
-  else
+  if [[ "$log_epoch" -lt "$cutoff_epoch" ]]; then
     log_warn "${ip}: último registro no log é de ${last_date} (mais de 7 dias) — avançando para Stage 2."
     return 1
   fi
+
+  log "${ip}: log recente (${last_date}) — confirmando evidência em file-store (arquivo .tgz ≤ 7 dias)..."
+  local tgz_out
+  tgz_out="$(root_cmd "$ip" "find /var/vmware/nsx/file-store -maxdepth 1 -name 'support-bundle*.tgz' -mtime -7 2>/dev/null | sort || true")"
+
+  if [[ -z "$tgz_out" ]]; then
+    log_warn "${ip}: log recente encontrado, mas nenhum arquivo .tgz foi confirmado em /var/vmware/nsx/file-store nos últimos 7 dias — avançando para Stage 2."
+    return 1
+  fi
+
+  STAGE1_BUNDLE_FILES="$tgz_out"
+
+  echo ""
+  printf "  ${_C_GREEN}┌─ ${ip}: evidência Stage 1 — arquivo(s) confirmados em file-store (≤ 7 dias) ─────${_C_RESET}\n"
+  while IFS= read -r tfile; do
+    printf "  ${_C_GREEN}│${_C_RESET}  %s\n" "${tfile}"
+  done <<< "$tgz_out"
+  printf "  ${_C_GREEN}└────────────────────────────────────────────────────────────────────────────────${_C_RESET}\n"
+  echo ""
+
+  log_ok "${ip}: bundle confirmado por evidência em file-store — data do log: ${last_date}."
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -703,7 +728,7 @@ cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 # Phase 2 (5-min polling) removed — monitoring is done externally.
 #
 # PRE-CHECK stages:
-#   1. check_bundle_log_recent  — log indica bundle gerado nos últimos 7 dias → existe
+#   1. check_bundle_log_recent  — log recente só vale se houver evidência: arquivo .tgz em file-store criado nos últimos 7 dias
 #   2. check_existing_bundle    — busca .tgz em file-store ou via 'get files'
 #   3. check_bundle_in_progress — detecta processo ou arquivo parcial em andamento
 set -euo pipefail
@@ -745,12 +770,12 @@ for ip in "${EDGE_IPS[@]}"; do
   check_bundle_log_recent "$ip" || recent_rc=$?
 
   if [[ "$recent_rc" -eq 0 ]]; then
-    log "${ip}: [Stage 1] bundle recente detectado no log — verificando se usuário quer gerar novo."
-    printf '%s,precheck,stage1_log_recent,found,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-    existing_label="[log recente ≤ 7 dias]"
+    log "${ip}: [Stage 1] evidência confirmada em file-store — verificando se usuário quer gerar novo."
+    printf '%s,precheck,stage1_log_recent,confirmed,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+    existing_label="${STAGE1_BUNDLE_FILES}"
     if ! prompt_new_bundle "$ip" "${existing_label}"; then
       SKIP_SB["$ip"]="true"
-      printf '%s,precheck,existing_bundle,skipped_log_recent,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+      printf '%s,precheck,existing_bundle,skipped_stage1_confirmed,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
     else
       log "${ip}: usuário solicitou novo bundle — prosseguindo."
       printf '%s,precheck,existing_bundle,new_requested,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
@@ -1043,6 +1068,13 @@ echo "      log_cmd   magenta    comando SSH enviado (>> cmd)"
 echo "      log_banner ciano     cabeçalho de fase/seção"
 echo "      box ┌│└   azul       bordas do box de log"
 echo "      prompts   azul bold  prompts interativos"
+echo ""
+echo "  Ajuste aplicado neste deploy:"
+echo "    - Stage 1 agora só considera bundle existente com evidência real"
+echo "    - Evidência válida: arquivo support-bundle*.tgz em /var/vmware/nsx/file-store"
+echo "      existente e com mtime nos últimos 7 dias"
+echo "    - O prompt agora mostra o nome real do arquivo confirmado"
+echo "    - Se o log for recente mas não houver arquivo, o fluxo segue para Stage 2"
 echo ""
 echo "  Novidades v2.8:"
 echo "    - check_bundle_log: tail -1 (apenas última linha)"
