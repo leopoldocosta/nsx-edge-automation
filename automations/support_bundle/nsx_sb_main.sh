@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# nsx_sb_main.sh — v2.7
-# Orchestrator: PRE-CHECK (3-stage) + Phase 1 (request SB) + Phase 2 (verify every 5 min)
-# Recommended: run inside screen or tmux (~35 min total)
+# nsx_sb_main.sh — v2.8
+# Orchestrator: PRE-CHECK (3-stage) + Phase 1 (request SB)
+# Phase 2 (5-min polling) removed — monitoring is done externally.
+# Recommended: run inside screen or tmux
 #
 # PRE-CHECK stages:
 #   1. check_bundle_log_recent  — se o log indica bundle gerado nos últimos 7 dias → existe
@@ -106,39 +107,7 @@ for ip in "${EDGE_IPS[@]}"; do
   request_support_bundle "$ip"
   printf '%s,phase1,sb_requested,ok,%s\n'     "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
 done
-log "Phase 1 done. Waiting for bundles to generate..."
-
-# ---- PHASE 2: Verify every 5 min, up to 30 min (6 rounds) ----
-log "=== PHASE 2: Verification ==="
-declare -A NODE_DONE
-for ip in "${EDGE_IPS[@]}"; do
-  [[ "${SKIP_SB[$ip]}" == "true" ]] && NODE_DONE["$ip"]="true" || NODE_DONE["$ip"]="false"
-done
-
-for ((round=1; round<=6; round++)); do
-  log "Check ${round}/6 — sleeping 5 min..."
-  sleep 300
-  for ip in "${EDGE_IPS[@]}"; do
-    [[ "${NODE_DONE[$ip]}" == "true" ]] && continue
-    OUT="$(check_support_bundle "$ip" || true)"
-    if grep -qiE 'error|fail|unable|denied' <<< "$OUT"; then
-      log_err  "${ip}: error detected — stopping checks for this node."
-      printf '%s,phase2,error,%q,%s\n'   "$ip" "$OUT" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-      NODE_DONE["$ip"]="true"
-    elif grep -qiE 'complete|generated|success' <<< "$OUT" && ! grep -q 'FILE_NOT_FOUND' <<< "$OUT"; then
-      log_ok   "${ip}: bundle confirmed."
-      printf '%s,phase2,success,%q,%s\n' "$ip" "$OUT" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-      NODE_DONE["$ip"]="true"
-    else
-      # Still pending — fetch last line of support_bundle.log for live progress
-      LAST_LOG_LINE="$(root_cmd "$ip" \
-        "test -f /var/log/support_bundle.log && tail -1 /var/log/support_bundle.log || echo '(log not found)'" \
-        2>/dev/null || echo '(ssh error)')"
-      log_warn "${ip}: still pending... | last log: ${LAST_LOG_LINE}"
-      printf '%s,phase2,pending,%q,%s\n' "$ip" "$OUT" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-    fi
-  done
-done
+log "Phase 1 done. Bundles requested — monitoring is done externally."
 
 # ---- FINAL: Disable root SSH on all nodes ----
 log "=== FINAL: Disabling root SSH ==="
