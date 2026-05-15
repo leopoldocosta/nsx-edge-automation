@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v3.5
+# deploy_nsx_sb_check.sh  v3.6
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
 # USO:
@@ -23,7 +23,7 @@ mkdir -p "${AUTO_DIR}/logs" "${AUTO_DIR}/run" "${LIB_DIR}" "${DOCS_DIR}" "${EXAM
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v3.5"
+echo "  NSX Edge Automation — Support Bundle Kit  v3.6"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -58,30 +58,36 @@ session.env
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh  — v3.5
+# lib/common.sh  — v3.6
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh  — v3.5
+# lib/common.sh  — v3.6
 #
-# CORREÇÃO v3.5 — padrão de detecção de bundles ampliado:
+# CORREÇÃO v3.6 — detecção de falha de autenticação admin:
 #
-#   Antes o grep usava apenas 'support-bundle.*\.tgz', não detectando:
-#     - sb_172_18_214_17_20260514_172052.tgz   (prefixo sb_)
-#     - support_bundle_20220216_0132.tgz        (prefixo support_bundle_ com underscore)
-#     - arquivos .tgz criados manualmente com qualquer nome
+#   enable_root_ssh e disable_root_ssh capturavam a saída de admin_cmd_tty
+#   com || true, ignorando silenciosamente "Permission denied".
+#   O script continuava tentando root SSH num node onde o admin já havia
+#   falhado, gerando erros confusos nas etapas seguintes.
 #
-#   Novo padrão em _BUNDLE_GREP:
-#     Arquivo começa com support-bundle, support_bundle, sb_  OU termina com .tgz
-#     Exceto arquivos que claramente não são bundles (flow-cache, backup_restore, etc.)
-#     A abordagem pragmática: qualquer .tgz no file-store É um bundle.
+#   Novo comportamento em enable_root_ssh:
+#     1. Captura stdout+stderr do 'set ssh root-login'
+#     2. Se detectar 'permission denied' ou 'authentication failed':
+#        - Loga [ERR] com mensagem clara
+#        - Adiciona o IP em NODE_AUTH_FAILED[] (array global)
+#        - Retorna código 1 (sem abort do script—o caller decide)
+#     3. nsx_sb_main.sh verifica NODE_AUTH_FAILED[] antes de cada etapa
+#        e pula o node, registrando 'auth_failed' no CSV
 #
-# Herdado v3.4:
-#   - ls+grep em vez de find (robusto no NSX Photon OS)
+#   disable_root_ssh: idem, falha de auth é logada como [WARN] (não crítico).
+#
+# Herdado v3.5:
+#   - _BUNDLE_GREP ampliado (support-bundle|support_bundle|sb_|*.tgz)
+#   - Múltiplos bundles: classificação por idade, contagem, mix recente+antigo
+#   - ls+grep em vez de find
 #   - root_cmd_tty expõe stderr
 #   - _bundle_age_days via stat epoch
-#   - enable_root_ssh inclui sleep 3
-#   - list_bundle_dir: ls -lh completo antes de qualquer consulta
 set -euo pipefail
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -104,6 +110,7 @@ _C_BLUE_BOLD='\033[1;34m'
 _C_BOX_TITLE='\033[44;1;37m'
 _C_BOX_GREEN_TITLE='\033[42;1;37m'
 _C_BOX_YELLOW_TITLE='\033[43;1;30m'
+_C_BOX_RED_TITLE='\033[41;1;37m'
 _C_BOX_SIDE='\033[1;37m'
 
 _CRED_DIR="/tmp"
@@ -116,14 +123,12 @@ BUNDLE_STATUS=""
 BUNDLE_FILES_RECENT=""
 BUNDLE_FILES_OLD=""
 
+# Array global de nodes com falha de autenticação admin
+declare -a NODE_AUTH_FAILED=()
+
 # ---------------------------------------------------------------------------
 # _BUNDLE_GREP — padrão ERE para identificar arquivos de support bundle
-#
-# Detecta qualquer um dos seguintes:
-#   - começa com support-bundle  (ex: support-bundle-172-18-214-18-20260514.tgz)
-#   - começa com support_bundle  (ex: support_bundle_20220216_0132.tgz)
-#   - começa com sb_             (ex: sb_172_18_214_17_20260514_172052.tgz)
-#   - termina com .tgz           (qualquer .tgz criado manualmente no diretório)
+# Detecta: support-bundle*, support_bundle*, sb_*, e qualquer *.tgz
 # ---------------------------------------------------------------------------
 _BUNDLE_GREP='(^support[-_]bundle|^sb_).*\.tgz$|\.tgz$'
 
@@ -142,6 +147,14 @@ _box_line(){
   local width="$1" char="${2:--}" out=""
   for (( i=0; i<width; i++ )); do out+="${char}"; done
   printf '%s' "${out}"
+}
+
+# ---------------------------------------------------------------------------
+# _is_auth_failed OUTPUT
+#   Retorna 0 (true) se a saída indica falha de autenticação SSH.
+# ---------------------------------------------------------------------------
+_is_auth_failed(){
+  echo "$1" | grep -qiE 'permission denied|authentication failed|publickey|no supported authentication'
 }
 
 collect_ips(){
@@ -259,19 +272,67 @@ root_cmd(){      local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>/dev/null; }
 admin_cmd_tty(){ local ip="$1" cmd="$2"; ssh_admin "$ip" "$cmd" 2>&1; }
 root_cmd_tty(){  local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>&1; }
 
-enable_root_ssh(){
+# ---------------------------------------------------------------------------
+# _node_auth_failed IP
+#   Retorna 0 se o IP está na lista de falha de autenticação.
+# ---------------------------------------------------------------------------
+_node_auth_failed(){
   local ip="$1"
-  log "${ip}: enabling root SSH..."
-  log_cmd "${ip}: set ssh root-login"
-  admin_cmd_tty "$ip" 'set ssh root-login' || true
-  sleep 3
+  local f
+  for f in "${NODE_AUTH_FAILED[@]:-}"; do
+    [[ "$f" == "$ip" ]] && return 0
+  done
+  return 1
 }
 
+# ---------------------------------------------------------------------------
+# enable_root_ssh IP
+#   Habilita root SSH via credencial admin.
+#   Detecta falha de autenticação ("Permission denied") e:
+#     - Loga [ERR] com mensagem clara
+#     - Adiciona IP em NODE_AUTH_FAILED[]
+#     - Exibe box vermelho
+#     - Retorna 1 (o caller deve pular o node)
+# ---------------------------------------------------------------------------
+enable_root_ssh(){
+  local ip="$1"
+  local out rc=0
+  log "${ip}: enabling root SSH..."
+  log_cmd "${ip}: set ssh root-login"
+  out="$(admin_cmd_tty "$ip" 'set ssh root-login' 2>&1)" || rc=$?
+  if _is_auth_failed "$out" || [[ $rc -eq 5 ]]; then
+    local width=74
+    local title=" ${ip}: FALHA DE AUTENTICACÃO ADMIN — node será pulado "
+    echo ""
+    printf "  ${_C_BOX_RED_TITLE}┌─%-*s─┐${_C_RESET}\n" "$(( width - 4 ))" "${title}"
+    printf "  ${_C_BOX_SIDE}│${_C_RESET}  %s\n" "${out}"
+    printf "  ${_C_BOX_SIDE}└%s┘${_C_RESET}\n" "$(_box_line $(( width - 2 )) '─')"
+    echo ""
+    log_err "${ip}: 'set ssh root-login' recusado — senha admin incorreta, conta bloqueada ou credencial expirada."
+    log_err "${ip}: verifique manualmente: ssh ${NSX_USER}@${ip}"
+    NODE_AUTH_FAILED+=("$ip")
+    return 1
+  fi
+  [[ -n "$out" ]] && log "${ip}: [set ssh root-login] ${out}"
+  sleep 3
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# disable_root_ssh IP
+#   Desabilita root SSH. Falha de auth é logada como [WARN] (não crítico).
+# ---------------------------------------------------------------------------
 disable_root_ssh(){
   local ip="$1"
+  local out rc=0
   log "${ip}: disabling root SSH..."
   log_cmd "${ip}: clear ssh root-login"
-  admin_cmd_tty "$ip" 'clear ssh root-login' || true
+  out="$(admin_cmd_tty "$ip" 'clear ssh root-login' 2>&1)" || rc=$?
+  if _is_auth_failed "$out" || [[ $rc -eq 5 ]]; then
+    log_warn "${ip}: falha ao desabilitar root SSH (auth). Desabilite manualmente se necessário."
+    return 0
+  fi
+  [[ -n "$out" ]] && log "${ip}: [clear ssh root-login] ${out}"
 }
 
 # ---------------------------------------------------------------------------
@@ -302,7 +363,6 @@ check_bundle_log(){
 
 # ---------------------------------------------------------------------------
 # list_bundle_dir IP
-#   Imprime ls -lh /var/vmware/nsx/file-store/ completo via root SSH.
 # ---------------------------------------------------------------------------
 list_bundle_dir(){
   local ip="$1"
@@ -326,7 +386,6 @@ list_bundle_dir(){
 
 # ---------------------------------------------------------------------------
 # _bundle_age_days IP FILEPATH
-#   Retorna a idade do arquivo em dias (inteiro) via stat epoch no node remoto.
 # ---------------------------------------------------------------------------
 _bundle_age_days(){
   local ip="$1" fpath="$2"
@@ -336,8 +395,7 @@ _bundle_age_days(){
   file_epoch="$(echo "${file_epoch}" | tr -cd '0-9')"
   now_epoch="$(echo "${now_epoch}" | tr -cd '0-9')"
   if [[ -z "$file_epoch" || "$file_epoch" == "0" || -z "$now_epoch" ]]; then
-    echo 999
-    return
+    echo 999; return
   fi
   age=$(( (now_epoch - file_epoch) / 86400 ))
   echo "$age"
@@ -345,10 +403,6 @@ _bundle_age_days(){
 
 # ---------------------------------------------------------------------------
 # _list_bundles IP
-#   Lista arquivos de support bundle em /var/vmware/nsx/file-store usando
-#   ls -1 com grep ERE ampliado (_BUNDLE_GREP).
-#   Detecta: support-bundle*, support_bundle*, sb_*, e qualquer *.tgz.
-#   Retorna os nomes de arquivo (sem path), um por linha.
 # ---------------------------------------------------------------------------
 _list_bundles(){
   local ip="$1"
@@ -358,15 +412,6 @@ _list_bundles(){
 
 # ---------------------------------------------------------------------------
 # check_bundle_status IP
-#   Preenche: BUNDLE_STATUS, BUNDLE_FILES_RECENT, BUNDLE_FILES_OLD
-#   Status: recent | old | none | inprogress
-#
-#   Com múltiplos bundles:
-#     - Se qualquer um for recente (≤7d)  → status=recent (pula geração)
-#     - Se todos forem antigos (>7d)      → status=old    (deleta + gera)
-#     - Mix recente+antigo                → status=recent (mantém recentes,
-#                                           BUNDLE_FILES_OLD preenchido para
-#                                           limpeza opcional via --clean-old)
 # ---------------------------------------------------------------------------
 check_bundle_status(){
   local ip="$1"
@@ -377,21 +422,16 @@ check_bundle_status(){
   local width=74
 
   log "${ip}: [PRE-CHECK] verificando status do support bundle..."
-
-  # Passo 0: listar diretório completo
   list_bundle_dir "$ip"
 
-  # Passo 1: processo de geração em andamento?
   local proc_out
   proc_out="$(root_cmd_tty "$ip" \
     "ps aux 2>/dev/null | grep -iE 'support_bundle|support-bundle|napi.*bundle' | grep -v grep || true")"
   if [[ -n "$proc_out" ]]; then
     log_warn "${ip}: geração de bundle em andamento (processo detectado)."
-    BUNDLE_STATUS="inprogress"
-    return 0
+    BUNDLE_STATUS="inprogress"; return 0
   fi
 
-  # Passo 2: listar bundles com padrão ampliado
   local all_bundles
   all_bundles="$(_list_bundles "$ip")"
   log "${ip}: [bundles detectados] resultado bruto: '${all_bundles:-<vazio>}'"
@@ -405,7 +445,6 @@ check_bundle_status(){
   bundle_count="$(echo "$all_bundles" | grep -c '.' || true)"
   log "${ip}: ${bundle_count} bundle(s) encontrado(s)."
 
-  # Passo 3: classificar por idade via stat
   local f age fpath
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
@@ -422,7 +461,6 @@ check_bundle_status(){
   BUNDLE_FILES_RECENT="${BUNDLE_FILES_RECENT%$'\n'}"
   BUNDLE_FILES_OLD="${BUNDLE_FILES_OLD%$'\n'}"
 
-  # Decide status
   if [[ -n "$BUNDLE_FILES_RECENT" ]]; then
     BUNDLE_STATUS="recent"
     local rec_count old_count
@@ -439,15 +477,14 @@ check_bundle_status(){
     if [[ -n "$BUNDLE_FILES_OLD" ]]; then
       while IFS= read -r fline; do
         [[ -z "$fline" ]] && continue
-        printf "  ${_C_BOX_SIDE}│${_C_RESET}  ⚠  %s  [ANTIGO]\'\n" "$(basename "$fline")"
+        printf "  ${_C_BOX_SIDE}│${_C_RESET}  ⚠  %s  [ANTIGO]\n" "$(basename "$fline")"
       done <<< "$BUNDLE_FILES_OLD"
     fi
     printf "  ${_C_BOX_SIDE}└%s┘${_C_RESET}\n" "$(_box_line $(( width - 2 )) '─')"
     echo ""
     log_ok "${ip}: bundle recente presente — geração será pulada."
-    if [[ -n "$BUNDLE_FILES_OLD" ]]; then
-      log_warn "${ip}: existem também bundle(s) antigo(s) — use --clean-old para remover."
-    fi
+    [[ -n "$BUNDLE_FILES_OLD" ]] && \
+      log_warn "${ip}: bundle(s) antigo(s) presentes — use --clean-all para remover."
     return 0
   fi
 
@@ -607,30 +644,33 @@ for ip in "${EDGE_IPS[@]}"; do
   {
     echo "====================================== Node: ${ip}"
     ping -c 1 -W 2 "$ip" 2>&1 || echo "WARN: ping filtrado"
-    admin_cmd_tty "$ip" 'get version'     || echo "FAIL"
-    admin_cmd_tty "$ip" 'get service ssh' || echo "FAIL"
-    admin_cmd_tty "$ip" 'get managers'   || echo "FAIL"
-    enable_root_ssh "$ip"
-    root_cmd_tty "$ip" 'uname -a'  || echo "FAIL"
-    root_cmd_tty "$ip" 'uptime'    || echo "FAIL"
-    root_cmd_tty "$ip" 'df -h /var/log' || echo "FAIL"
-    root_cmd_tty "$ip" 'ls -lh /var/log/support_bundle.log 2>/dev/null || echo FILE_NOT_FOUND'
-    list_bundle_dir "$ip"
-    disable_root_ssh "$ip"
+    admin_cmd_tty "$ip" 'get version'     || echo "FAIL admin SSH"
+    admin_cmd_tty "$ip" 'get service ssh' || echo "FAIL admin SSH"
+    admin_cmd_tty "$ip" 'get managers'   || echo "FAIL admin SSH"
+    if enable_root_ssh "$ip"; then
+      root_cmd_tty "$ip" 'uname -a'  || echo "FAIL root SSH"
+      root_cmd_tty "$ip" 'uptime'    || echo "FAIL root SSH"
+      root_cmd_tty "$ip" 'df -h /var/log' || echo "FAIL root SSH"
+      root_cmd_tty "$ip" 'ls -lh /var/log/support_bundle.log 2>/dev/null || echo FILE_NOT_FOUND'
+      list_bundle_dir "$ip"
+      disable_root_ssh "$ip"
+    fi
     echo
   } | tee -a "$REPORT"
 done
+[[ ${#NODE_AUTH_FAILED[@]} -gt 0 ]] && \
+  log_warn "Nodes com falha de autenticação admin: ${NODE_AUTH_FAILED[*]}"
 log_ok "Teste concluído. Relatório: ${REPORT}"
 prompt_clear_creds
 TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_main.sh  — v3.5
+# nsx_sb_main.sh  — v3.6
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v3.5
+# nsx_sb_main.sh  — v3.6
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -651,9 +691,14 @@ declare -a REPORT_LINES=()
 if [[ "$CLEAN_ALL" == true ]]; then
   log_banner "CLEAN-ALL: Apagando TODOS os bundles existentes"
   for ip in "${EDGE_IPS[@]}"; do
-    enable_root_ssh "$ip"
+    if ! enable_root_ssh "$ip"; then
+      printf '%s,clean_all,auth_failed,admin_auth_error,%s\n' "$ip" "$(date +%F_%T)" \
+        | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+      continue
+    fi
     list_bundle_dir "$ip"
     delete_all_bundles "$ip"
+    disable_root_ssh "$ip"
     printf '%s,clean_all,deleted_all,ok,%s\n' "$ip" "$(date +%F_%T)" \
       | tee -a "$RUN_LOG" >> "$STATUS_CSV"
   done
@@ -663,7 +708,13 @@ log_banner "PRE-CHECK: Verificando bundles existentes"
 
 for ip in "${EDGE_IPS[@]}"; do
   log "${ip}: iniciando PRE-CHECK..."
-  enable_root_ssh "$ip"
+
+  if ! enable_root_ssh "$ip"; then
+    printf '%s,precheck,auth_failed,admin_auth_error,%s\n' "$ip" "$(date +%F_%T)" \
+      | tee -a "$RUN_LOG" >> "$STATUS_CSV"
+    REPORT_LINES+=("${ip}|AUTH FALHOU|PULADO|—")
+    continue
+  fi
 
   check_bundle_log "$ip" || true
   check_bundle_status "$ip"
@@ -693,6 +744,12 @@ done
 log_banner "PHASE 1: Support Bundle Request (background)"
 
 for ip in "${EDGE_IPS[@]}"; do
+  # Pula nodes com falha de autenticação
+  if _node_auth_failed "$ip"; then
+    log "${ip}: pulando (falha de autenticação admin)."
+    continue
+  fi
+
   local_acao=""
   for entry in "${REPORT_LINES[@]}"; do
     if [[ "${entry%%|*}" == "$ip" ]]; then
@@ -715,6 +772,7 @@ log_ok "Phase 1 done — bundles disparados em background."
 
 log_banner "FINAL: Disabling root SSH"
 for ip in "${EDGE_IPS[@]}"; do
+  _node_auth_failed "$ip" && continue
   disable_root_ssh "$ip" || true
   printf '%s,final,root_ssh_disabled,ok,%s\n' "$ip" "$(date +%F_%T)" \
     | tee -a "$RUN_LOG" >> "$STATUS_CSV"
@@ -730,11 +788,19 @@ for entry in "${REPORT_LINES[@]}"; do
   IFS='|' read -r r_ip r_status r_acao r_arquivo <<< "$entry"
   r_arq_short="$(basename "${r_arquivo%%$'\n'*}" 2>/dev/null || echo "${r_arquivo}")"
   [[ ${#r_arq_short} -gt 18 ]] && r_arq_short="${r_arq_short:0:15}..."
-  printf "${_C_CYAN}║${_C_RESET} %-17s ${_C_CYAN}║${_C_RESET} %-16s ${_C_CYAN}║${_C_RESET} %-16s ${_C_CYAN}║${_C_RESET} %-18s ${_C_CYAN}║${_C_RESET}\n" \
-    "$r_ip" "$r_status" "$r_acao" "$r_arq_short"
+  # Linha vermelha para auth_failed
+  if [[ "$r_status" == "AUTH FALHOU" ]]; then
+    printf "${_C_RED}║${_C_RESET} %-17s ${_C_RED}║${_C_RESET} %-16s ${_C_RED}║${_C_RESET} %-16s ${_C_RED}║${_C_RESET} %-18s ${_C_RED}║${_C_RESET}\n" \
+      "$r_ip" "$r_status" "$r_acao" "$r_arq_short"
+  else
+    printf "${_C_CYAN}║${_C_RESET} %-17s ${_C_CYAN}║${_C_RESET} %-16s ${_C_CYAN}║${_C_RESET} %-16s ${_C_CYAN}║${_C_RESET} %-18s ${_C_CYAN}║${_C_RESET}\n" \
+      "$r_ip" "$r_status" "$r_acao" "$r_arq_short"
+  fi
 done
 printf "${_C_CYAN}╚═══════════════════╩══════════════════╩══════════════════╩════════════════════╝${_C_RESET}\n"
 echo ""
+[[ ${#NODE_AUTH_FAILED[@]} -gt 0 ]] && \
+  log_warn "Nodes com falha de autenticação: ${NODE_AUTH_FAILED[*]} — verifique credenciais manualmente."
 log "Para acompanhar a geração: tail -f ${LOG_DIR}/sb_bg_*.log"
 log_ok "Status CSV: ${STATUS_CSV}"
 
@@ -779,11 +845,16 @@ printf "${_C_BLUE_BOLD}Comando shell para executar como root: ${_C_RESET}"
 read -r SHELL_CMD
 [[ -z "${SHELL_CMD}" ]] && { log_err "Nenhum comando fornecido."; exit 1; }
 for ip in "${EDGE_IPS[@]}"; do
-  enable_root_ssh "$ip"
+  if ! enable_root_ssh "$ip"; then
+    log_warn "${ip}: pulando (falha de autenticação admin)."
+    continue
+  fi
   log_cmd "${ip}: ${SHELL_CMD}"
   root_cmd_tty "$ip" "${SHELL_CMD}" || log_warn "${ip}: comando retornou erro"
   disable_root_ssh "$ip"
 done
+[[ ${#NODE_AUTH_FAILED[@]} -gt 0 ]] && \
+  log_warn "Nodes pulados (auth falhou): ${NODE_AUTH_FAILED[*]}"
 prompt_clear_creds
 ROTX
 chmod +x "${AUTO_DIR}/root_exec.sh"
@@ -825,36 +896,39 @@ chmod +x "${AUTO_DIR}/nsx_ssh_cli.sh"
 # MANUAL.md
 # ---------------------------------------------------------------------------
 cat > "${DOCS_DIR}/MANUAL.md" <<'MANUALDOC'
-# NSX Edge Automation — Manual de Uso  v3.5
+# NSX Edge Automation — Manual de Uso  v3.6
 
-## Correções v3.5
+## Correções v3.6
 
 | Problema | Correção |
 |---|---|
-| grep `support-bundle.*\.tgz` não detectava `sb_*` nem `support_bundle_*` | Novo padrão `_BUNDLE_GREP` via ERE: `(^support[-_]bundle\|^sb_).*\.tgz$\|\.tgz$` |
-| Múltiplos bundles no mesmo diretório não eram todos reportados | `check_bundle_status` itera sobre cada arquivo, classifica e exibe contagem |
-| `delete_all_bundles` usava grep restrito | Agora usa `_list_bundles()` com o mesmo `_BUNDLE_GREP` ampliado |
+| `enable_root_ssh` ignorava "Permission denied" com `\|\| true` | Captura saída, detecta falha de auth, loga `[ERR]`, adiciona IP em `NODE_AUTH_FAILED[]` e retorna 1 |
+| Script continuava para root SSH após falha admin | `nsx_sb_main.sh` verifica `_node_auth_failed` antes de cada fase |
+| Nodes com auth falha apareciam como sucesso no relatório | Linha vermelha no relatório final + aviso consolidado ao final |
+| `disable_root_ssh` também silenciava auth errors | Agora loga `[WARN]` e orienta desabilitar manualmente |
+
+## Comportamento com falha de autenticação
+
+```
+[ERR]  172.18.214.19: 'set ssh root-login' recusado — senha admin incorreta,
+       conta bloqueada ou credencial expirada.
+[ERR]  172.18.214.19: verifique manualmente: ssh admin@172.18.214.19
+```
+
+- O node é adicionado a `NODE_AUTH_FAILED[]`
+- Todas as etapas subsequentes (precheck, bundle request, disable root SSH) pulam o node
+- O relatório final exibe a linha em **vermelho** com status `AUTH FALHOU`
+- Ao final, lista consolidada dos nodes com problema
 
 ## Padrão de detecção de bundles (`_BUNDLE_GREP`)
 
 | Nome do arquivo | Detectado? |
 |---|---|
-| `support-bundle-172-18-214-18-20260514.tgz` | ✔ prefixo `support-bundle` |
-| `support_bundle_20220216_0132.tgz` | ✔ prefixo `support_bundle` |
-| `sb_172_18_214_17_20260514_172052.tgz` | ✔ prefixo `sb_` |
-| `qualquer-coisa.tgz` | ✔ terminador `.tgz` |
-| `flow-cache-dump-0.gz` | ✗ não é `.tgz` |
-| `backup_restore_helper.py` | ✗ não é `.tgz` |
-
-## Fluxo de Support Bundle (v3.5)
-
-| Situação detectada | Ação automática |
-|---|---|
-| Bundle(s) ≤ 7 dias | **Pula** geração — exibe contagem de recentes e antigos |
-| Apenas bundles > 7 dias | **Deleta** + gera novo (background) |
-| Mix recente + antigo | **Pula** — avisa sobre antigos (use `--clean-all`) |
-| Nenhum bundle | **Gera** novo (background) |
-| Geração em andamento | **Pula** |
+| `support-bundle-172-18-214-18-20260514.tgz` | ✔ |
+| `support_bundle_20220216_0132.tgz` | ✔ |
+| `sb_172_18_214_17_20260514_172052.tgz` | ✔ |
+| `qualquer-nome-manual.tgz` | ✔ |
+| `flow-cache-dump-0.gz` | ✗ |
 
 ## Deploy
 
@@ -887,13 +961,14 @@ fi
 
 echo ""
 echo "================================================================"
-echo "  Deploy concluído! v3.5"
+echo "  Deploy concluído! v3.6"
 echo "================================================================"
 echo ""
-echo "  Correção principal v3.5:"
-echo "    _BUNDLE_GREP detecta: support-bundle*, support_bundle*, sb_*, *.tgz"
-echo "    Múltiplos bundles: exibe contagem e classifica por idade"
-echo "    Mix recente+antigo: mantém recentes, avisa sobre antigos"
+echo "  Correção principal v3.6:"
+echo "    enable_root_ssh detecta Permission denied e aborta o node"
+echo "    NODE_AUTH_FAILED[] rastreia nodes com falha de auth admin"
+echo "    Relatório final: linha vermelha + aviso consolidado"
+echo "    root_exec.sh e test_connections.sh também respeitam o guard"
 echo ""
 echo "Próximos passos:"
 echo "  1. cd ${AUTO_DIR} && ./test_connections.sh"
