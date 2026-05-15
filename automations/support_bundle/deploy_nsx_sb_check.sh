@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v3.6
+# deploy_nsx_sb_check.sh  v3.7
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
 # USO:
@@ -23,7 +23,7 @@ mkdir -p "${AUTO_DIR}/logs" "${AUTO_DIR}/run" "${LIB_DIR}" "${DOCS_DIR}" "${EXAM
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v3.6"
+echo "  NSX Edge Automation — Support Bundle Kit  v3.7"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -58,36 +58,38 @@ session.env
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh  — v3.6
+# lib/common.sh  — v3.7
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh  — v3.6
+# lib/common.sh  — v3.7
 #
-# CORREÇÃO v3.6 — detecção de falha de autenticação admin:
+# CORREÇÃO v3.7 — dois bugs corrigidos:
 #
-#   enable_root_ssh e disable_root_ssh capturavam a saída de admin_cmd_tty
-#   com || true, ignorando silenciosamente "Permission denied".
-#   O script continuava tentando root SSH num node onde o admin já havia
-#   falhado, gerando erros confusos nas etapas seguintes.
+#   Bug 1: falso positivo "geração em andamento" no ps grep
+#     O padrão anterior 'support_bundle|support-bundle|napi.*bundle' capturava
+#     o próprio processo do script (nsx_sb_main.sh contém "support_bundle" no
+#     nome do diretório na linha de comando do bash).
+#     Novo padrão preciso, baseado nos processos reais observados no NSX:
+#       gen_support_bundle      — sudo/sh que dispara a geração
+#       support_bundles/__self__.py — python3 que executa a geração
+#     Esses padrões são exclusivos do NSX e jamais coincidem com nosso script.
 #
-#   Novo comportamento em enable_root_ssh:
-#     1. Captura stdout+stderr do 'set ssh root-login'
-#     2. Se detectar 'permission denied' ou 'authentication failed':
-#        - Loga [ERR] com mensagem clara
-#        - Adiciona o IP em NODE_AUTH_FAILED[] (array global)
-#        - Retorna código 1 (sem abort do script—o caller decide)
-#     3. nsx_sb_main.sh verifica NODE_AUTH_FAILED[] antes de cada etapa
-#        e pula o node, registrando 'auth_failed' no CSV
+#   Bug 2: warnings do cliente SSH local contaminavam saída remota
+#     Mensagens como "/etc/ssh/ssh_config line 59: Unsupported option
+#     gssapiauthentication" vinham do cliente SSH do host de monitoramento
+#     e apareciam nos boxes de ls/log porque root_cmd_tty usa 2>&1.
+#     Correção: adicionado -o LogLevel=ERROR em ssh_admin e ssh_root,
+#     suprimindo todos os warnings/notices do cliente SSH local.
 #
-#   disable_root_ssh: idem, falha de auth é logada como [WARN] (não crítico).
+# Herdado v3.6:
+#   - enable_root_ssh detecta Permission denied e registra NODE_AUTH_FAILED[]
+#   - disable_root_ssh loga [WARN] em vez de silenciar falha de auth
+#   - nsx_sb_main.sh pula nodes em NODE_AUTH_FAILED[] em todas as fases
 #
 # Herdado v3.5:
-#   - _BUNDLE_GREP ampliado (support-bundle|support_bundle|sb_|*.tgz)
+#   - _BUNDLE_GREP ampliado: support-bundle|support_bundle|sb_|*.tgz
 #   - Múltiplos bundles: classificação por idade, contagem, mix recente+antigo
-#   - ls+grep em vez de find
-#   - root_cmd_tty expõe stderr
-#   - _bundle_age_days via stat epoch
 set -euo pipefail
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -132,6 +134,19 @@ declare -a NODE_AUTH_FAILED=()
 # ---------------------------------------------------------------------------
 _BUNDLE_GREP='(^support[-_]bundle|^sb_).*\.tgz$|\.tgz$'
 
+# ---------------------------------------------------------------------------
+# _BUNDLE_PROC_GREP — padrão preciso para detectar geração em andamento
+#
+# Processos reais observados no NSX durante geração de support bundle:
+#   sudo .../gen_support_bundle ...
+#   /bin/sh .../gen_support_bundle ...
+#   python3 .../support_bundles/__self__.py ...
+#
+# NÃO usa padrões genéricos como 'support_bundle' que colidiriam com o
+# nome do diretório do nosso próprio script.
+# ---------------------------------------------------------------------------
+_BUNDLE_PROC_GREP='gen_support_bundle|support_bundles/__self__\.py'
+
 log(){        printf "${_C_WHITE}[%s] %s${_C_RESET}\n"         "$(date '+%F %T')" "$*"; }
 log_ok(){     printf "${_C_GREEN}[%s] [OK]   %s${_C_RESET}\n"  "$(date '+%F %T')" "$*"; }
 log_warn(){   printf "${_C_YELLOW}[%s] [WARN] %s${_C_RESET}\n" "$(date '+%F %T')" "$*"; }
@@ -151,7 +166,6 @@ _box_line(){
 
 # ---------------------------------------------------------------------------
 # _is_auth_failed OUTPUT
-#   Retorna 0 (true) se a saída indica falha de autenticação SSH.
 # ---------------------------------------------------------------------------
 _is_auth_failed(){
   echo "$1" | grep -qiE 'permission denied|authentication failed|publickey|no supported authentication'
@@ -249,11 +263,20 @@ prompt_clear_creds(){
   else clear_creds; fi
 }
 
+# ---------------------------------------------------------------------------
+# ssh_admin / ssh_root
+#   -o LogLevel=ERROR suprime warnings do cliente SSH local (ex: opções
+#   obsoletas no /etc/ssh/ssh_config do host de monitoramento) que
+#   contaminavam a saída dos comandos remotos capturados via 2>&1.
+# ---------------------------------------------------------------------------
 ssh_admin(){
   local ip="$1"; shift
   export SSHPASS="${NSX_PASS}"
-  sshpass -e ssh -o StrictHostKeyChecking=accept-new \
-    -o UserKnownHostsFile="${_KNOWN_HOSTS}" -o ConnectTimeout=15 \
+  sshpass -e ssh \
+    -o StrictHostKeyChecking=accept-new \
+    -o UserKnownHostsFile="${_KNOWN_HOSTS}" \
+    -o ConnectTimeout=15 \
+    -o LogLevel=ERROR \
     "${NSX_USER}@${ip}" "$@"
   local _rc=$?; unset SSHPASS; return $_rc
 }
@@ -261,8 +284,11 @@ ssh_admin(){
 ssh_root(){
   local ip="$1"; shift
   export SSHPASS="${ROOT_PASS}"
-  sshpass -e ssh -o StrictHostKeyChecking=accept-new \
-    -o UserKnownHostsFile="${_KNOWN_HOSTS}" -o ConnectTimeout=15 \
+  sshpass -e ssh \
+    -o StrictHostKeyChecking=accept-new \
+    -o UserKnownHostsFile="${_KNOWN_HOSTS}" \
+    -o ConnectTimeout=15 \
+    -o LogLevel=ERROR \
     "root@${ip}" "$@"
   local _rc=$?; unset SSHPASS; return $_rc
 }
@@ -274,7 +300,6 @@ root_cmd_tty(){  local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>&1; }
 
 # ---------------------------------------------------------------------------
 # _node_auth_failed IP
-#   Retorna 0 se o IP está na lista de falha de autenticação.
 # ---------------------------------------------------------------------------
 _node_auth_failed(){
   local ip="$1"
@@ -287,12 +312,6 @@ _node_auth_failed(){
 
 # ---------------------------------------------------------------------------
 # enable_root_ssh IP
-#   Habilita root SSH via credencial admin.
-#   Detecta falha de autenticação ("Permission denied") e:
-#     - Loga [ERR] com mensagem clara
-#     - Adiciona IP em NODE_AUTH_FAILED[]
-#     - Exibe box vermelho
-#     - Retorna 1 (o caller deve pular o node)
 # ---------------------------------------------------------------------------
 enable_root_ssh(){
   local ip="$1"
@@ -302,7 +321,7 @@ enable_root_ssh(){
   out="$(admin_cmd_tty "$ip" 'set ssh root-login' 2>&1)" || rc=$?
   if _is_auth_failed "$out" || [[ $rc -eq 5 ]]; then
     local width=74
-    local title=" ${ip}: FALHA DE AUTENTICACÃO ADMIN — node será pulado "
+    local title=" ${ip}: FALHA DE AUTENTICAÇÃO ADMIN — node será pulado "
     echo ""
     printf "  ${_C_BOX_RED_TITLE}┌─%-*s─┐${_C_RESET}\n" "$(( width - 4 ))" "${title}"
     printf "  ${_C_BOX_SIDE}│${_C_RESET}  %s\n" "${out}"
@@ -320,7 +339,6 @@ enable_root_ssh(){
 
 # ---------------------------------------------------------------------------
 # disable_root_ssh IP
-#   Desabilita root SSH. Falha de auth é logada como [WARN] (não crítico).
 # ---------------------------------------------------------------------------
 disable_root_ssh(){
   local ip="$1"
@@ -424,11 +442,14 @@ check_bundle_status(){
   log "${ip}: [PRE-CHECK] verificando status do support bundle..."
   list_bundle_dir "$ip"
 
+  # Detecta geração em andamento usando padrão preciso (_BUNDLE_PROC_GREP)
+  # Evita falso positivo com o nome do próprio script ou diretório.
   local proc_out
   proc_out="$(root_cmd_tty "$ip" \
-    "ps aux 2>/dev/null | grep -iE 'support_bundle|support-bundle|napi.*bundle' | grep -v grep || true")"
+    "ps -ef 2>/dev/null | grep -E '${_BUNDLE_PROC_GREP}' | grep -v grep || true")"
   if [[ -n "$proc_out" ]]; then
     log_warn "${ip}: geração de bundle em andamento (processo detectado)."
+    log "${ip}: processo: ${proc_out}"
     BUNDLE_STATUS="inprogress"; return 0
   fi
 
@@ -574,6 +595,7 @@ request_support_bundle(){
       -o StrictHostKeyChecking=accept-new \
       -o UserKnownHostsFile="${_KNOWN_HOSTS}" \
       -o ConnectTimeout=15 \
+      -o LogLevel=ERROR \
       -o ServerAliveInterval=30 \
       -o ServerAliveCountMax=120 \
       "${NSX_USER}@${ip}" \
@@ -666,11 +688,11 @@ TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_main.sh  — v3.6
+# nsx_sb_main.sh  — v3.7
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v3.6
+# nsx_sb_main.sh  — v3.7
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -744,7 +766,6 @@ done
 log_banner "PHASE 1: Support Bundle Request (background)"
 
 for ip in "${EDGE_IPS[@]}"; do
-  # Pula nodes com falha de autenticação
   if _node_auth_failed "$ip"; then
     log "${ip}: pulando (falha de autenticação admin)."
     continue
@@ -788,7 +809,6 @@ for entry in "${REPORT_LINES[@]}"; do
   IFS='|' read -r r_ip r_status r_acao r_arquivo <<< "$entry"
   r_arq_short="$(basename "${r_arquivo%%$'\n'*}" 2>/dev/null || echo "${r_arquivo}")"
   [[ ${#r_arq_short} -gt 18 ]] && r_arq_short="${r_arq_short:0:15}..."
-  # Linha vermelha para auth_failed
   if [[ "$r_status" == "AUTH FALHOU" ]]; then
     printf "${_C_RED}║${_C_RESET} %-17s ${_C_RED}║${_C_RESET} %-16s ${_C_RED}║${_C_RESET} %-16s ${_C_RED}║${_C_RESET} %-18s ${_C_RED}║${_C_RESET}\n" \
       "$r_ip" "$r_status" "$r_acao" "$r_arq_short"
@@ -886,7 +906,9 @@ else
 fi
 log "Conectando em ${LOGIN_USER}@${TARGET_IP}..."
 sshpass -e ssh -o StrictHostKeyChecking=accept-new \
-  -o UserKnownHostsFile="${_KNOWN_HOSTS}" -o ConnectTimeout=15 \
+  -o UserKnownHostsFile="${_KNOWN_HOSTS}" \
+  -o ConnectTimeout=15 \
+  -o LogLevel=ERROR \
   "${LOGIN_USER}@${TARGET_IP}"
 unset SSHPASS
 CLISCRIPT
@@ -896,29 +918,27 @@ chmod +x "${AUTO_DIR}/nsx_ssh_cli.sh"
 # MANUAL.md
 # ---------------------------------------------------------------------------
 cat > "${DOCS_DIR}/MANUAL.md" <<'MANUALDOC'
-# NSX Edge Automation — Manual de Uso  v3.6
+# NSX Edge Automation — Manual de Uso  v3.7
 
-## Correções v3.6
+## Correções v3.7
 
-| Problema | Correção |
-|---|---|
-| `enable_root_ssh` ignorava "Permission denied" com `\|\| true` | Captura saída, detecta falha de auth, loga `[ERR]`, adiciona IP em `NODE_AUTH_FAILED[]` e retorna 1 |
-| Script continuava para root SSH após falha admin | `nsx_sb_main.sh` verifica `_node_auth_failed` antes de cada fase |
-| Nodes com auth falha apareciam como sucesso no relatório | Linha vermelha no relatório final + aviso consolidado ao final |
-| `disable_root_ssh` também silenciava auth errors | Agora loga `[WARN]` e orienta desabilitar manualmente |
+| Problema | Causa raiz | Correção |
+|---|---|---|
+| Falso positivo "geração em andamento" | `ps grep` usava padrão genérico que coincidia com o nome do próprio script | Novo `_BUNDLE_PROC_GREP`: `gen_support_bundle\|support_bundles/__self__\.py` — exclusivo do NSX |
+| Linha `/etc/ssh/ssh_config: Unsupported option` aparecia nos boxes | Warnings do cliente SSH local capturados via `2>&1` | `-o LogLevel=ERROR` em `ssh_admin` e `ssh_root` |
 
-## Comportamento com falha de autenticação
+## Como identificar geração em andamento (NSX)
 
-```
-[ERR]  172.18.214.19: 'set ssh root-login' recusado — senha admin incorreta,
-       conta bloqueada ou credencial expirada.
-[ERR]  172.18.214.19: verifique manualmente: ssh admin@172.18.214.19
+```bash
+ps -ef | grep -E 'gen_support_bundle|support_bundles/__self__\.py' | grep -v grep
 ```
 
-- O node é adicionado a `NODE_AUTH_FAILED[]`
-- Todas as etapas subsequentes (precheck, bundle request, disable root SSH) pulam o node
-- O relatório final exibe a linha em **vermelho** com status `AUTH FALHOU`
-- Ao final, lista consolidada dos nodes com problema
+Processos esperados durante geração:
+```
+sudo   .../gen_support_bundle /image/... <args>
+/bin/sh .../gen_support_bundle /image/... <args>
+python3 .../support_bundles/__self__.py /image/... <args>
+```
 
 ## Padrão de detecção de bundles (`_BUNDLE_GREP`)
 
@@ -961,14 +981,12 @@ fi
 
 echo ""
 echo "================================================================"
-echo "  Deploy concluído! v3.6"
+echo "  Deploy concluído! v3.7"
 echo "================================================================"
 echo ""
-echo "  Correção principal v3.6:"
-echo "    enable_root_ssh detecta Permission denied e aborta o node"
-echo "    NODE_AUTH_FAILED[] rastreia nodes com falha de auth admin"
-echo "    Relatório final: linha vermelha + aviso consolidado"
-echo "    root_exec.sh e test_connections.sh também respeitam o guard"
+echo "  Correções v3.7:"
+echo "    _BUNDLE_PROC_GREP preciso: gen_support_bundle|support_bundles/__self__.py"
+echo "    LogLevel=ERROR em ssh_admin/ssh_root: sem warnings do cliente SSH local"
 echo ""
 echo "Próximos passos:"
 echo "  1. cd ${AUTO_DIR} && ./test_connections.sh"
