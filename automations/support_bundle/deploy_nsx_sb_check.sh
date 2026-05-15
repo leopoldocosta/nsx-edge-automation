@@ -92,6 +92,7 @@ cat > "${LIB_DIR}/common.sh" <<'COMMON'
 # FIX v2.8:
 #   - nsx_sb_main.sh: Phase 2 (polling 5 min) removida — monitoramento externo
 #   - SHA stale fix: SHA sempre buscado de refs/heads/main antes de qualquer update
+#   - check_bundle_log: tail -10 → tail -1 (apenas última linha do log)
 # FIX v2.7:
 #   - PRE-CHECK 3-stage logic (log recent / file-store / in-progress)
 # FIX v2.6:
@@ -330,7 +331,7 @@ disable_root_ssh(){
 
 # ---------------------------------------------------------------------------
 # check_bundle_log IP
-#   Lê /var/log/support_bundle.log (últimas 10 linhas) e exibe ao operador.
+#   Lê /var/log/support_bundle.log (última linha) e exibe ao operador.
 #   Retorna: 0=ok, 1=erros/warnings no log, 2=arquivo não encontrado
 # ---------------------------------------------------------------------------
 check_bundle_log(){
@@ -338,8 +339,8 @@ check_bundle_log(){
   local log_file="/var/log/support_bundle.log"
   local out
 
-  log "${ip}: lendo ${log_file} (últimas 10 linhas)..."
-  out="$(root_cmd "$ip" "test -f ${log_file} && tail -10 ${log_file} || echo '__FILE_NOT_FOUND__'")"
+  log "${ip}: lendo ${log_file} (última linha)..."
+  out="$(root_cmd "$ip" "test -f ${log_file} && tail -1 ${log_file} || echo '__FILE_NOT_FOUND__'")"
 
   if grep -q '__FILE_NOT_FOUND__' <<< "$out"; then
     log_warn "${ip}: ${log_file} não encontrado — geração anterior pode não ter ocorrido."
@@ -347,19 +348,17 @@ check_bundle_log(){
   fi
 
   echo ""
-  echo "  ┌─ ${ip}: ${log_file} (últimas 10 linhas) ─────────────────────"
-  while IFS= read -r line; do
-    echo "  │  ${line}"
-  done <<< "$out"
+  echo "  ┌─ ${ip}: ${log_file} (última linha) ──────────────────────────"
+  echo "  │  ${out}"
   echo "  └────────────────────────────────────────────────────────────────"
   echo ""
 
   if grep -qiE 'error|fail|exception|abort|fatal' <<< "$out"; then
-    log_warn "${ip}: ATENÇÃO — problemas detectados no log da geração anterior (ver acima)."
+    log_warn "${ip}: ATENÇÃO — problema detectado na última linha do log (ver acima)."
     return 1
   fi
 
-  log_ok "${ip}: log da geração anterior sem erros aparentes."
+  log_ok "${ip}: última linha do log sem erros aparentes."
   return 0
 }
 
@@ -1015,6 +1014,7 @@ echo "    - nsx_sb_main.sh: Phase 2 (polling a cada 5 min) removida"
 echo "      O monitoramento do bundle deve ser feito externamente."
 echo "    - SHA stale fix: SHA sempre buscado de refs/heads/main antes"
 echo "      de qualquer update para evitar conflitos de cache."
+echo "    - check_bundle_log: tail -10 → tail -1 (apenas última linha)"
 echo ""
 echo "  Novidades v2.7:"
 echo "    - PRE-CHECK 3 estágios: log recente (7d) / file-store / in-progress"
@@ -1023,8 +1023,7 @@ echo "    - Stage 2: detecta .tgz em file-store ou via 'get files'"
 echo "    - Stage 3: detecta geração em andamento (processo ou arquivo parcial)"
 echo ""
 echo "  Novidades v2.6:"
-echo "    - FIX: Fase 2 exibe última linha de /var/log/support_bundle.log"
-echo "      junto ao WARN quando o node ainda estava pendente"
+echo "    - FIX: exibe última linha de /var/log/support_bundle.log no WARN pending"
 echo ""
 echo "Próximos passos:"
 echo "  1. Edite o arquivo de IPs:"
