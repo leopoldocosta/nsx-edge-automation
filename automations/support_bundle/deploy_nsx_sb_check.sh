@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v3.3
+# deploy_nsx_sb_check.sh  v3.4
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
 # USO:
@@ -23,7 +23,7 @@ mkdir -p "${AUTO_DIR}/logs" "${AUTO_DIR}/run" "${LIB_DIR}" "${DOCS_DIR}" "${EXAM
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v3.3"
+echo "  NSX Edge Automation — Support Bundle Kit  v3.4"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -58,31 +58,28 @@ session.env
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh  — v3.3
+# lib/common.sh  — v3.4
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh  — v3.3
+# lib/common.sh  — v3.4
 #
-# Correções v3.3:
-#   1. enable_root_ssh + sleep 3 GARANTIDO antes de qualquer root_cmd
-#      em check_bundle_status. Antes o root SSH podia não estar ativo
-#      quando o find era executado, retornando vazio e causando nova geração.
+# CORREÇÃO PRINCIPAL v3.4:
+#   O root_cmd usa 2>/dev/null. No NSX Photon OS o find pode falhar
+#   silenciosamente (AppArmor, owner www-data no diretório, SSH ainda
+#   inicializando), retornando vazio mesmo com arquivos presentes.
 #
-#   2. list_bundle_dir IP
-#      Imprime ls -lh /var/vmware/nsx/file-store/ completo via root SSH,
-#      com box de título azul. Chamado ANTES do find em check_bundle_status.
-#      Torna visível o que existe no diretório, independente do resultado.
+#   Substitui find por ls + awk em check_bundle_status:
+#     - ls -1 é muito mais simples e robusto no Photon OS
+#     - root tem permissão de leitura nos arquivos (rw-r----- root www-data)
+#     - stderr SEMPRE exposto (root_cmd_tty) nos comandos de diagnóstico
+#     - A data de modificação é obtida via stat (epoch) para calcular idade
 #
-#   3. find com log bruto
-#      O resultado raw do find é sempre logado antes de ser avaliado,
-#      facilitando diagnóstico quando o diretório tem arquivos mas o
-#      padrão glob não casa.
-#
-# Herdado v3.2:
-#   - Boxes com título em FUNDO COLORIDO (ANSI 4x)
-#   - delete_all_bundles IP  (--clean-all)
-#   - request_support_bundle IP  (background, não trava)
+# Herdado v3.3:
+#   - enable_root_ssh inclui sleep 3
+#   - list_bundle_dir: ls -lh antes de qualquer consulta
+#   - Boxes com fundo colorido (ANSI 4x)
+#   - delete_all_bundles | request_support_bundle background
 set -euo pipefail
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -94,22 +91,18 @@ EDGE_EXAMPLE="${AUTO_DIR}/edge_nodes.example"
 
 mkdir -p "${LOG_DIR}" "${RUN_DIR}"
 
-# Cores gerais
 _C_RESET='\033[0m'
 _C_WHITE='\033[0;37m'
-_C_BRIGHT='\033[1;37m'
 _C_GREEN='\033[1;32m'
 _C_YELLOW='\033[1;33m'
 _C_RED='\033[1;31m'
 _C_CYAN='\033[1;36m'
 _C_MAGENTA='\033[0;35m'
 _C_BLUE_BOLD='\033[1;34m'
-
-# Box — títulos com fundo colorido
-_C_BOX_TITLE='\033[44;1;37m'         # fundo azul   + branco brilhante
-_C_BOX_GREEN_TITLE='\033[42;1;37m'   # fundo verde  + branco brilhante
-_C_BOX_YELLOW_TITLE='\033[43;1;30m'  # fundo amarelo + preto
-_C_BOX_SIDE='\033[1;37m'             # borda lateral: branco brilhante
+_C_BOX_TITLE='\033[44;1;37m'
+_C_BOX_GREEN_TITLE='\033[42;1;37m'
+_C_BOX_YELLOW_TITLE='\033[43;1;30m'
+_C_BOX_SIDE='\033[1;37m'
 
 _CRED_DIR="/tmp"
 [[ -d "/dev/shm" ]] && _CRED_DIR="/dev/shm"
@@ -117,7 +110,6 @@ _CRED_FILE="${_CRED_DIR}/.nsx_session_${UID}"
 _KNOWN_HOSTS="/tmp/.nsx_known_hosts_${UID}"
 touch "${_KNOWN_HOSTS}" 2>/dev/null && chmod 600 "${_KNOWN_HOSTS}" 2>/dev/null || true
 
-# Variáveis globais preenchidas por check_bundle_status
 BUNDLE_STATUS=""
 BUNDLE_FILES_RECENT=""
 BUNDLE_FILES_OLD=""
@@ -271,14 +263,12 @@ disable_root_ssh(){
 
 # ---------------------------------------------------------------------------
 # check_bundle_log IP
-#   Exibe última linha de /var/log/support_bundle.log (box fundo azul).
-#   PRE-REQUISITO: root SSH já ativo.
 # ---------------------------------------------------------------------------
 check_bundle_log(){
   local ip="$1"
   local log_file="/var/log/support_bundle.log"
   local out
-  out="$(root_cmd "$ip" "test -f ${log_file} && tail -1 ${log_file} || echo '__FILE_NOT_FOUND__'")"
+  out="$(root_cmd_tty "$ip" "test -f ${log_file} && tail -1 ${log_file} || echo '__FILE_NOT_FOUND__'")"
   if grep -q '__FILE_NOT_FOUND__' <<< "$out"; then
     log_warn "${ip}: ${log_file} não encontrado."
     return 2
@@ -300,8 +290,7 @@ check_bundle_log(){
 # ---------------------------------------------------------------------------
 # list_bundle_dir IP
 #   Imprime ls -lh /var/vmware/nsx/file-store/ completo via root SSH.
-#   Chamado ANTES do find em check_bundle_status para visibilidade total.
-#   PRE-REQUISITO: root SSH já ativo.
+#   Usa root_cmd_tty para expor qualquer erro de stderr.
 # ---------------------------------------------------------------------------
 list_bundle_dir(){
   local ip="$1"
@@ -309,11 +298,13 @@ list_bundle_dir(){
   local title=" ${ip}: ls -lh ${dir}/ "
   local width=74
   local out
-  out="$(root_cmd "$ip" "ls -lh ${dir}/ 2>&1 || echo '__LS_FAILED__'")"
+  # root_cmd_tty expõe stderr — qualquer falha fica visível
+  out="$(root_cmd_tty "$ip" "ls -lh ${dir}/")"
+  local ls_rc=$?
   echo ""
   printf "  ${_C_BOX_TITLE}┌─%-*s─┐${_C_RESET}\n" "$(( width - 4 ))" "${title}"
-  if grep -q '__LS_FAILED__' <<< "$out"; then
-    printf "  ${_C_BOX_SIDE}│${_C_RESET}  [ERRO] Falha ao listar ${dir}\n"
+  if [[ -z "${out}" ]]; then
+    printf "  ${_C_BOX_SIDE}│${_C_RESET}  [vazio ou erro ao listar]\n"
   else
     while IFS= read -r line; do
       printf "  ${_C_BOX_SIDE}│${_C_RESET}  %s\n" "${line}"
@@ -324,62 +315,99 @@ list_bundle_dir(){
 }
 
 # ---------------------------------------------------------------------------
+# _bundle_age_days IP FILEPATH
+#   Retorna a idade do arquivo em dias (inteiro) via stat no node remoto.
+#   Usa epoch para cálculo exato, independente do locale.
+# ---------------------------------------------------------------------------
+_bundle_age_days(){
+  local ip="$1" fpath="$2"
+  local now_epoch file_epoch age
+  # stat -c %Y = mtime em epoch (Photon OS / GNU coreutils)
+  file_epoch="$(root_cmd_tty "$ip" "stat -c '%Y' '${fpath}' 2>/dev/null || echo 0")"
+  now_epoch="$(root_cmd_tty "$ip" "date +%s")"
+  file_epoch="$(echo "${file_epoch}" | tr -cd '0-9')"
+  now_epoch="$(echo "${now_epoch}" | tr -cd '0-9')"
+  if [[ -z "$file_epoch" || "$file_epoch" == "0" || -z "$now_epoch" ]]; then
+    echo 999  # sem info = trata como antigo
+    return
+  fi
+  age=$(( (now_epoch - file_epoch) / 86400 ))
+  echo "$age"
+}
+
+# ---------------------------------------------------------------------------
 # check_bundle_status IP
-#   PRE-REQUISITO: root SSH já ativo (enable_root_ssh já chamado + sleep 3).
+#   Usa ls + grep em vez de find para listar support-bundle*.tgz.
+#   find no NSX Photon OS falha silenciosamente por causa de:
+#     - diretório dono www-data com sticky bit
+#     - root SSH ainda estabilizando quando find é chamado
+#     - AppArmor / perfil de segurança do NSX
+#   ls é mais simples, já funciona e não tem esses problemas.
+#
 #   Preenche: BUNDLE_STATUS, BUNDLE_FILES_RECENT, BUNDLE_FILES_OLD
 #   Status: recent | old | none | inprogress
-#
-#   Ordem de execução:
-#     1. list_bundle_dir  — exibe ls -lh do diretório (visibilidade)
-#     2. verifica processo em andamento
-#     3. find -mtime -7  — bundles recentes (loga resultado bruto)
-#     4. find -mtime +7  — bundles antigos  (loga resultado bruto)
 # ---------------------------------------------------------------------------
 check_bundle_status(){
   local ip="$1"
   BUNDLE_STATUS="none"
   BUNDLE_FILES_RECENT=""
   BUNDLE_FILES_OLD=""
+  local dir="/var/vmware/nsx/file-store"
   local width=74
 
   log "${ip}: [PRE-CHECK] verificando status do support bundle..."
 
-  # Passo 0: listar diretório completo para visibilidade
+  # Passo 0: listar diretório completo (visibilidade + diagnóstico)
   list_bundle_dir "$ip"
 
-  # Passo 1: processo em andamento?
-  local proc_out partial_out
-  proc_out="$(root_cmd "$ip" \
+  # Passo 1: verificar processo de geração em andamento
+  local proc_out
+  proc_out="$(root_cmd_tty "$ip" \
     "ps aux 2>/dev/null | grep -iE 'support_bundle|support-bundle|napi.*bundle' | grep -v grep || true")"
-  partial_out="$(root_cmd "$ip" \
-    "find /var/vmware/nsx/file-store -maxdepth 1 -name 'support-bundle*' -newer /proc/1 -mmin -30 2>/dev/null || true")"
-  if [[ -n "$proc_out" || -n "$partial_out" ]]; then
-    log_warn "${ip}: geração de bundle em andamento detectada."
+  if [[ -n "$proc_out" ]]; then
+    log_warn "${ip}: geração de bundle em andamento (processo detectado)."
     BUNDLE_STATUS="inprogress"
     return 0
   fi
 
-  # Passo 2: find -mtime -7 (recentes) — loga resultado bruto
-  local raw_recent raw_old
-  raw_recent="$(root_cmd "$ip" \
-    "find /var/vmware/nsx/file-store -maxdepth 1 -name 'support-bundle*.tgz' -mtime -7 2>/dev/null | sort || true")"
-  log "${ip}: [find -mtime -7] resultado bruto: '${raw_recent:-<vazio>}'"
-  BUNDLE_FILES_RECENT="${raw_recent}"
+  # Passo 2: listar arquivos support-bundle*.tgz via ls + grep
+  #   root_cmd_tty expõe stderr; grep retorna 1 se vazio (|| true para não abortar)
+  local all_bundles
+  all_bundles="$(root_cmd_tty "$ip" \
+    "ls -1 ${dir}/ 2>&1 | grep 'support-bundle.*\.tgz' || true")"
+  log "${ip}: [ls+grep support-bundle*.tgz] resultado bruto: '${all_bundles:-<vazio>}'"
 
-  # Passo 3: find -mtime +7 (antigos) — loga resultado bruto
-  raw_old="$(root_cmd "$ip" \
-    "find /var/vmware/nsx/file-store -maxdepth 1 -name 'support-bundle*.tgz' -mtime +7 2>/dev/null | sort || true")"
-  log "${ip}: [find -mtime +7] resultado bruto: '${raw_old:-<vazio>}'"
-  BUNDLE_FILES_OLD="${raw_old}"
+  if [[ -z "$all_bundles" ]]; then
+    log "${ip}: nenhum bundle encontrado em file-store — será gerado."
+    return 0
+  fi
 
-  # Avalia resultado
+  # Passo 3: classificar cada arquivo por idade via stat
+  local f age fpath
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    fpath="${dir}/${f}"
+    age="$(_bundle_age_days "$ip" "$fpath")"
+    log "${ip}: arquivo '${f}' tem ${age} dia(s)."
+    if [[ "$age" -le 7 ]]; then
+      BUNDLE_FILES_RECENT+="${fpath}"$'\n'
+    else
+      BUNDLE_FILES_OLD+="${fpath}"$'\n'
+    fi
+  done <<< "$all_bundles"
+
+  # Remove trailing newlines
+  BUNDLE_FILES_RECENT="${BUNDLE_FILES_RECENT%$'\n'}"
+  BUNDLE_FILES_OLD="${BUNDLE_FILES_OLD%$'\n'}"
+
   if [[ -n "$BUNDLE_FILES_RECENT" ]]; then
     BUNDLE_STATUS="recent"
     local title=" ${ip}: bundle recente confirmado em file-store (≤ 7 dias) "
     echo ""
     printf "  ${_C_BOX_GREEN_TITLE}┌─%-*s─┐${_C_RESET}\n" "$(( width - 4 ))" "${title}"
-    while IFS= read -r f; do
-      printf "  ${_C_BOX_SIDE}│${_C_RESET}  %s\n" "$f"
+    while IFS= read -r fline; do
+      [[ -z "$fline" ]] && continue
+      printf "  ${_C_BOX_SIDE}│${_C_RESET}  %s\n" "$fline"
     done <<< "$BUNDLE_FILES_RECENT"
     printf "  ${_C_BOX_SIDE}└%s┘${_C_RESET}\n" "$(_box_line $(( width - 2 )) '─')"
     echo ""
@@ -392,8 +420,9 @@ check_bundle_status(){
     local title=" ${ip}: bundle(s) ANTIGO(S) em file-store (> 7 dias) "
     echo ""
     printf "  ${_C_BOX_YELLOW_TITLE}┌─%-*s─┐${_C_RESET}\n" "$(( width - 4 ))" "${title}"
-    while IFS= read -r f; do
-      printf "  ${_C_BOX_SIDE}│${_C_RESET}  %s\n" "$f"
+    while IFS= read -r fline; do
+      [[ -z "$fline" ]] && continue
+      printf "  ${_C_BOX_SIDE}│${_C_RESET}  %s\n" "$fline"
     done <<< "$BUNDLE_FILES_OLD"
     printf "  ${_C_BOX_SIDE}└%s┘${_C_RESET}\n" "$(_box_line $(( width - 2 )) '─')"
     echo ""
@@ -407,7 +436,6 @@ check_bundle_status(){
 
 # ---------------------------------------------------------------------------
 # delete_old_bundles IP
-#   Apaga apenas arquivos support-bundle*.tgz com mtime > 7 dias.
 # ---------------------------------------------------------------------------
 delete_old_bundles(){
   local ip="$1"
@@ -416,7 +444,7 @@ delete_old_bundles(){
   while IFS= read -r fpath; do
     [[ -z "$fpath" ]] && continue
     log_cmd "${ip}: rm -f ${fpath}"
-    if root_cmd "$ip" "rm -f '${fpath}' 2>/dev/null"; then
+    if root_cmd_tty "$ip" "rm -f '${fpath}'"; then
       log_warn "${ip}: deletado — ${fpath}"
     else
       log_err "${ip}: falha ao deletar — ${fpath}"
@@ -426,22 +454,23 @@ delete_old_bundles(){
 
 # ---------------------------------------------------------------------------
 # delete_all_bundles IP
-#   Apaga TODOS os arquivos support-bundle*.tgz em file-store (qualquer idade).
 # ---------------------------------------------------------------------------
 delete_all_bundles(){
   local ip="$1"
+  local dir="/var/vmware/nsx/file-store"
   log "${ip}: buscando TODOS os bundles para limpeza total..."
   local all_files
-  all_files="$(root_cmd "$ip" \
-    "find /var/vmware/nsx/file-store -maxdepth 1 -name 'support-bundle*.tgz' 2>/dev/null | sort || true")"
+  all_files="$(root_cmd_tty "$ip" \
+    "ls -1 ${dir}/ 2>&1 | grep 'support-bundle.*\.tgz' || true")"
   if [[ -z "$all_files" ]]; then
     log "${ip}: nenhum bundle encontrado para deletar."
     return 0
   fi
-  while IFS= read -r fpath; do
-    [[ -z "$fpath" ]] && continue
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    local fpath="${dir}/${f}"
     log_cmd "${ip}: rm -f ${fpath}"
-    if root_cmd "$ip" "rm -f '${fpath}' 2>/dev/null"; then
+    if root_cmd_tty "$ip" "rm -f '${fpath}'"; then
       log_warn "${ip}: deletado — ${fpath}"
     else
       log_err "${ip}: falha ao deletar — ${fpath}"
@@ -452,9 +481,6 @@ delete_all_bundles(){
 
 # ---------------------------------------------------------------------------
 # request_support_bundle IP
-#   Emite o comando 'get support-bundle' via SSH em BACKGROUND.
-#   O script retorna imediatamente — sem travar.
-#   Saída em: logs/sb_bg_<ip>_<ts>.log
 # ---------------------------------------------------------------------------
 request_support_bundle(){
   local ip="$1"
@@ -560,24 +586,11 @@ TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_main.sh  — v3.3
+# nsx_sb_main.sh  — v3.4
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v3.3
-#
-# Uso:
-#   ./nsx_sb_main.sh              # fluxo padrão
-#   ./nsx_sb_main.sh --clean-all  # apaga TODOS os bundles antes de gerar
-#
-# Fluxo automático por node:
-#   bundle recente (≤ 7d)  → pular
-#   bundle antigo  (> 7d)  → deletar + gerar (background)
-#   nenhum bundle          → gerar (background)
-#   geração em andamento   → pular
-#
-# enable_root_ssh (com sleep 3) é chamado UMA VEZ por node,
-# ANTES de qualquer root_cmd (list_bundle_dir, find, delete).
+# nsx_sb_main.sh  — v3.4
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export AUTO_DIR="${SCRIPT_DIR}"
@@ -595,32 +608,25 @@ echo 'ip,phase,status,details,timestamp' > "$STATUS_CSV"
 
 declare -a REPORT_LINES=()
 
-# ---- CLEAN-ALL (opcional) ----
 if [[ "$CLEAN_ALL" == true ]]; then
   log_banner "CLEAN-ALL: Apagando TODOS os bundles existentes"
   for ip in "${EDGE_IPS[@]}"; do
-    enable_root_ssh "$ip"   # já inclui sleep 3
+    enable_root_ssh "$ip"
     list_bundle_dir "$ip"
     delete_all_bundles "$ip"
     printf '%s,clean_all,deleted_all,ok,%s\n' "$ip" "$(date +%F_%T)" \
       | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-    # Não desabilita aqui: PRE-CHECK abaixo ainda usa root
   done
 fi
 
-# ---- PRE-CHECK ----
 log_banner "PRE-CHECK: Verificando bundles existentes"
 
 for ip in "${EDGE_IPS[@]}"; do
   log "${ip}: iniciando PRE-CHECK..."
-
-  # Garante root SSH ativo com sleep 3 (enable_root_ssh já faz o sleep)
-  # Se clean-all já foi rodado para este IP, o root SSH já está ativo;
-  # chamar novamente é idempotente (NSX aceita o comando repetido).
   enable_root_ssh "$ip"
 
   check_bundle_log "$ip" || true
-  check_bundle_status "$ip"   # chama list_bundle_dir internamente
+  check_bundle_status "$ip"
 
   printf '%s,precheck,bundle_status,%s,%s\n' "$ip" "$BUNDLE_STATUS" "$(date +%F_%T)" \
     | tee -a "$RUN_LOG" >> "$STATUS_CSV"
@@ -644,7 +650,6 @@ for ip in "${EDGE_IPS[@]}"; do
   esac
 done
 
-# ---- PHASE 1: Request Support Bundle (background) ----
 log_banner "PHASE 1: Support Bundle Request (background)"
 
 for ip in "${EDGE_IPS[@]}"; do
@@ -668,7 +673,6 @@ done
 
 log_ok "Phase 1 done — bundles disparados em background."
 
-# ---- FINAL: Disable root SSH ----
 log_banner "FINAL: Disabling root SSH"
 for ip in "${EDGE_IPS[@]}"; do
   disable_root_ssh "$ip" || true
@@ -676,7 +680,6 @@ for ip in "${EDGE_IPS[@]}"; do
     | tee -a "$RUN_LOG" >> "$STATUS_CSV"
 done
 
-# ---- RELATÓRIO COMPACTO FINAL ----
 echo ""
 printf "${_C_CYAN}╔══════════════════════════════════════════════════════════════════════════════╗${_C_RESET}\n"
 printf "${_C_CYAN}║  RELATÓRIO FINAL — Support Bundle Check  %-35s║${_C_RESET}\n" "$(date '+%F %T')"
@@ -685,7 +688,7 @@ printf "${_C_CYAN}║ %-17s ║ %-16s ║ %-16s ║ %-18s ║${_C_RESET}\n" "NOD
 printf "${_C_CYAN}╠═══════════════════╬══════════════════╬══════════════════╬════════════════════╣${_C_RESET}\n"
 for entry in "${REPORT_LINES[@]}"; do
   IFS='|' read -r r_ip r_status r_acao r_arquivo <<< "$entry"
-  r_arq_short="$(basename "${r_arquivo}" 2>/dev/null || echo "${r_arquivo}")"
+  r_arq_short="$(basename "${r_arquivo%%$'\n'*}" 2>/dev/null || echo "${r_arquivo}")"
   [[ ${#r_arq_short} -gt 18 ]] && r_arq_short="${r_arq_short:0:15}..."
   printf "${_C_CYAN}║${_C_RESET} %-17s ${_C_CYAN}║${_C_RESET} %-16s ${_C_CYAN}║${_C_RESET} %-16s ${_C_CYAN}║${_C_RESET} %-18s ${_C_CYAN}║${_C_RESET}\n" \
     "$r_ip" "$r_status" "$r_acao" "$r_arq_short"
@@ -782,17 +785,17 @@ chmod +x "${AUTO_DIR}/nsx_ssh_cli.sh"
 # MANUAL.md
 # ---------------------------------------------------------------------------
 cat > "${DOCS_DIR}/MANUAL.md" <<'MANUALDOC'
-# NSX Edge Automation — Manual de Uso  v3.3
+# NSX Edge Automation — Manual de Uso  v3.4
 
-## Correções v3.3
+## Correções v3.4
 
-| Problema | Correção |
+| Problema raiz | Correção |
 |---|---|
-| `find` retornava vazio com root SSH reciém habilitado | `enable_root_ssh` agora inclui `sleep 3`; chamado UMA VEZ por node antes de qualquer `root_cmd` |
-| Sem visibilidade do que há no diretório | `list_bundle_dir` imprime `ls -lh /var/vmware/nsx/file-store/` completo antes do `find` |
-| Resultado bruto do `find` não era logado | Agora logado explicitamente antes de avaliar |
+| `find` falha silenciosamente no NSX Photon OS (diretório dono `www-data`, AppArmor, SSH ainda inicializando) | Substituído por `ls -1 + grep` em `check_bundle_status` e `delete_all_bundles` |
+| `root_cmd` suprime stderr com `2>/dev/null` | Todos os comandos de diagnóstico usam `root_cmd_tty` (stderr visível) |
+| `find -mtime` depende de comportamento de filesystem | Idade calculada via `stat -c %Y` (epoch) com aritmética explícita |
 
-## Fluxo de Support Bundle (v3.3)
+## Fluxo de Support Bundle (v3.4)
 
 | Situação detectada | Ação automática |
 |---|---|
@@ -841,16 +844,14 @@ fi
 
 echo ""
 echo "================================================================"
-echo "  Deploy concluído! v3.3"
+echo "  Deploy concluído! v3.4"
 echo "================================================================"
 echo ""
-echo "  Correções v3.3:"
-echo "    1. enable_root_ssh inclui sleep 3 garantido antes do find"
-echo "    2. list_bundle_dir: ls -lh do file-store antes de qualquer find"
-echo "    3. find -mtime: resultado bruto sempre logado para diagnóstico"
-echo ""
-echo "  Herdado v3.2:"
-echo "    - Boxes com FUNDO COLORIDO | delete_all_bundles | background SB"
+echo "  Correção principal v3.4:"
+echo "    - find substituido por ls+grep (robusto no NSX Photon OS)"
+echo "    - Todos os cmds de diagnóstico usam root_cmd_tty (stderr visível)"
+echo "    - Idade do arquivo via stat epoch (exato, sem depender do find)"
+echo "    - Nova func: _bundle_age_days IP FPATH"
 echo ""
 echo "Próximos passos:"
 echo "  1. cd ${AUTO_DIR} && ./test_connections.sh"
