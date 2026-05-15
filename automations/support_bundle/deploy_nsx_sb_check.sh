@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v2.7
+# deploy_nsx_sb_check.sh  v2.8
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
 # USO:
@@ -35,7 +35,7 @@ mkdir -p \
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v2.7"
+echo "  NSX Edge Automation — Support Bundle Kit  v2.8"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -76,22 +76,24 @@ session.env
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh  — v2.7
+# lib/common.sh  — v2.8
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh  — v2.7
+# lib/common.sh  — v2.8
 # Biblioteca compartilhada para todos os scripts NSX Edge Automation.
 # Autenticação: sempre sshpass (senha). Sem chaves SSH.
 #
-# PRE-CHECK bundle detection (v2.7) — lógica 3 estágios:
+# PRE-CHECK bundle detection (v2.7+) — lógica 3 estágios:
 #   Stage 1: check_bundle_log_recent  — log indica bundle gerado nos últimos 7 dias
 #   Stage 2: check_existing_bundle    — busca .tgz em file-store ou via 'get files'
 #   Stage 3: check_bundle_in_progress — detecta processo ou arquivo parcial em andamento
 #
+# FIX v2.8:
+#   - nsx_sb_main.sh: Phase 2 (polling 5 min) removida — monitoramento externo
+#   - SHA stale fix: SHA sempre buscado de refs/heads/main antes de qualquer update
 # FIX v2.7:
 #   - PRE-CHECK 3-stage logic (log recent / file-store / in-progress)
-#   - SHA stale fix em check_existing_bundle
 # FIX v2.6:
 #   - nsx_sb_main.sh: exibe última linha de support_bundle.log no WARN pending
 # FIX v2.5:
@@ -661,13 +663,14 @@ TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_main.sh  — v2.7
-# PRE-CHECK 3-stage logic
+# nsx_sb_main.sh  — v2.8
+# Phase 2 (polling 5 min) removida — monitoramento externo
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v2.7
-# Orquestrador: PRE-CHECK (3 estágios) + Fase 1 (solicitar SB) + Fase 2 (verificar a cada 5 min)
+# nsx_sb_main.sh  — v2.8
+# Orchestrator: PRE-CHECK (3-stage) + Phase 1 (request SB)
+# Phase 2 (5-min polling) removed — monitoring is done externally.
 #
 # PRE-CHECK stages:
 #   1. check_bundle_log_recent  — se o log indica bundle gerado nos últimos 7 dias → existe
@@ -760,8 +763,8 @@ for ip in "${EDGE_IPS[@]}"; do
   printf '%s,precheck,existing_bundle,none,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
 done
 
-# ---- FASE 1: Solicitar Support Bundle ----
-log "=== FASE 1: Solicitação do Support Bundle ==="
+# ---- PHASE 1: Enable root SSH + Request Support Bundle ----
+log "=== PHASE 1: Support Bundle Request ==="
 for ip in "${EDGE_IPS[@]}"; do
   if [[ "${SKIP_SB[$ip]}" == "true" ]]; then
     log "${ip}: pulando solicitação (bundle existente ou em andamento)."
@@ -772,47 +775,16 @@ for ip in "${EDGE_IPS[@]}"; do
   request_support_bundle "$ip"
   printf '%s,phase1,sb_requested,ok,%s\n'     "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
 done
-log "Fase 1 concluída. Aguardando geração dos bundles..."
+log "Phase 1 done. Bundles requested — monitoring is done externally."
 
-# ---- FASE 2: Verificar a cada 5 min, por até 30 min (6 rodadas) ----
-log "=== FASE 2: Verificação ==="
-declare -A NODE_DONE
-for ip in "${EDGE_IPS[@]}"; do
-  [[ "${SKIP_SB[$ip]}" == "true" ]] && NODE_DONE["$ip"]="true" || NODE_DONE["$ip"]="false"
-done
-
-for ((round=1; round<=6; round++)); do
-  log "Verificação ${round}/6 — aguardando 5 min..."
-  sleep 300
-  for ip in "${EDGE_IPS[@]}"; do
-    [[ "${NODE_DONE[$ip]}" == "true" ]] && continue
-    OUT="$(check_support_bundle "$ip" || true)"
-    if grep -qiE 'error|fail|unable|denied' <<< "$OUT"; then
-      log_err  "${ip}: erro detectado — encerrando verificações para este node."
-      printf '%s,phase2,error,%q,%s\n'   "$ip" "$OUT" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-      NODE_DONE["$ip"]="true"
-    elif grep -qiE 'complete|generated|success' <<< "$OUT" && ! grep -q 'FILE_NOT_FOUND' <<< "$OUT"; then
-      log_ok   "${ip}: bundle confirmado."
-      printf '%s,phase2,success,%q,%s\n' "$ip" "$OUT" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-      NODE_DONE["$ip"]="true"
-    else
-      LAST_LOG_LINE="$(root_cmd "$ip" \
-        "test -f /var/log/support_bundle.log && tail -1 /var/log/support_bundle.log || echo '(log not found)'" \
-        2>/dev/null || echo '(ssh error)')"
-      log_warn "${ip}: ainda pendente... | last log: ${LAST_LOG_LINE}"
-      printf '%s,phase2,pending,%q,%s\n' "$ip" "$OUT" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-    fi
-  done
-done
-
-# ---- FINAL: Desabilitar root SSH em todos os nodes ----
-log "=== FINAL: Desabilitando root SSH ==="
+# ---- FINAL: Disable root SSH on all nodes ----
+log "=== FINAL: Disabling root SSH ==="
 for ip in "${EDGE_IPS[@]}"; do
   disable_root_ssh "$ip" || true
   printf '%s,final,root_ssh_disabled,ok,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
 done
 
-log_ok "Concluído. CSV de status: ${STATUS_CSV}"
+log_ok "Done. Status CSV: ${STATUS_CSV}"
 prompt_clear_creds
 MAIN
 chmod +x "${AUTO_DIR}/nsx_sb_main.sh"
@@ -1035,8 +1007,14 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "================================================================"
-echo "  Deploy concluído! v2.7"
+echo "  Deploy concluído! v2.8"
 echo "================================================================"
+echo ""
+echo "  Novidades v2.8:"
+echo "    - nsx_sb_main.sh: Phase 2 (polling a cada 5 min) removida"
+echo "      O monitoramento do bundle deve ser feito externamente."
+echo "    - SHA stale fix: SHA sempre buscado de refs/heads/main antes"
+echo "      de qualquer update para evitar conflitos de cache."
 echo ""
 echo "  Novidades v2.7:"
 echo "    - PRE-CHECK 3 estágios: log recente (7d) / file-store / in-progress"
@@ -1046,11 +1024,7 @@ echo "    - Stage 3: detecta geração em andamento (processo ou arquivo parcial
 echo ""
 echo "  Novidades v2.6:"
 echo "    - FIX: Fase 2 exibe última linha de /var/log/support_bundle.log"
-echo "      junto ao WARN quando o node ainda está pendente"
-echo ""
-echo "  Novidades v2.5:"
-echo "    - admin_cmd/root_cmd suprimem stderr (sem contaminação por avisos SSH)"
-echo "    - admin_cmd_tty/root_cmd_tty para output ao vivo no terminal"
+echo "      junto ao WARN quando o node ainda estava pendente"
 echo ""
 echo "Próximos passos:"
 echo "  1. Edite o arquivo de IPs:"
