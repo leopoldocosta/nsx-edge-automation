@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v2.9
+# deploy_nsx_sb_check.sh  v3.0
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
 # USO:
@@ -35,7 +35,7 @@ mkdir -p \
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v2.9"
+echo "  NSX Edge Automation — Support Bundle Kit  v3.0"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -76,11 +76,11 @@ session.env
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh  — v2.9
+# lib/common.sh  — v3.0
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh  — v2.9
+# lib/common.sh  — v3.0
 # Shared library for all NSX Edge automations.
 # Provides: SSH access (admin + root), IP loading, credential handling.
 #
@@ -96,17 +96,20 @@ cat > "${LIB_DIR}/common.sh" <<'COMMON'
 # ("Warning: Permanently added ...") never contaminate captured stdout.
 # This prevents false-positive bundle detection and spurious WARN alerts.
 #
-# PRE-CHECK bundle detection (v2.7) — 3-stage logic:
-#   Stage 1: check_bundle_log_recent — if support_bundle.log shows a bundle
-#            generated within the last 7 days, confirm evidence by checking
-#            that a support-bundle*.tgz file really exists in file-store and
-#            was created in the last 7 days.
+# PRE-CHECK bundle detection (v3.0) — 3-stage logic:
+#   Stage 1: check_bundle_log_recent — se support_bundle.log indica bundle
+#            gerado nos últimos 7 dias, a evidência é confirmada em 2 passos:
+#            a) última linha do log é exibida (box azul)
+#            b) arquivo support-bundle*.tgz em file-store com mtime ≤ 7 dias
+#               é buscado e exibido (box verde)
+#            Apenas o nome real do arquivo .tgz é passado ao prompt.
+#            Se não houver arquivo físico, avança para Stage 2.
 #   Stage 2: check_existing_bundle   — look for .tgz files in file-store or
 #            via 'get files' (admin CLI).
 #   Stage 3: check_bundle_in_progress — detect an active generation process
 #            (napi/python pid running support_bundle collection).
 #
-# ANSI color output (v2.9):
+# ANSI color output (v3.0):
 #   log       — plain white    (general info)
 #   log_ok    — bold green     (success)
 #   log_warn  — bold yellow    (warnings)
@@ -152,7 +155,7 @@ _CRED_FILE="${_CRED_DIR}/.nsx_session_${UID}"
 _KNOWN_HOSTS="/tmp/.nsx_known_hosts_${UID}"
 touch "${_KNOWN_HOSTS}" 2>/dev/null && chmod 600 "${_KNOWN_HOSTS}" 2>/dev/null || true
 
-# Guarda evidência validada do Stage 1 para exibição no prompt
+# Guarda o nome real do arquivo .tgz confirmado no Stage 1
 STAGE1_BUNDLE_FILES=""
 
 # ---------------------------------------------------------------------------
@@ -380,7 +383,7 @@ disable_root_ssh(){
 
 # ---------------------------------------------------------------------------
 # check_bundle_log IP
-#   Reads /var/log/support_bundle.log on the node (last line).
+#   Reads /var/log/support_bundle.log on the node (last line only).
 #   Returns: 0=ok, 1=errors/warnings found in log, 2=file not found
 # ---------------------------------------------------------------------------
 check_bundle_log(){
@@ -414,7 +417,12 @@ check_bundle_log(){
 # ---------------------------------------------------------------------------
 # check_bundle_log_recent IP
 #   Stage 1 of PRE-CHECK.
-#   Returns: 0=recent found with file evidence, 1=not found, 2=log absent
+#   Evidência válida = arquivo .tgz em file-store com mtime ≤ 7 dias.
+#   Exibe:
+#     Box azul  — última linha do log (para saber o que foi registrado)
+#     Box verde — nome do arquivo .tgz confirmado em file-store
+#   STAGE1_BUNDLE_FILES recebe apenas o(s) nome(s) real(is) do(s) arquivo(s).
+#   Returns: 0=evidência confirmada, 1=não encontrado, 2=log ausente
 # ---------------------------------------------------------------------------
 check_bundle_log_recent(){
   local ip="$1"
@@ -449,6 +457,10 @@ check_bundle_log_recent(){
     return 1
   fi
 
+  # Log recente — captura última linha para exibição
+  local last_log_line
+  last_log_line="$(tail -1 <<< "$out")"
+
   log "${ip}: log recente (${last_date}) — confirmando evidência em file-store (arquivo .tgz ≤ 7 dias)..."
   local tgz_out
   tgz_out="$(root_cmd "$ip" "find /var/vmware/nsx/file-store -maxdepth 1 -name 'support-bundle*.tgz' -mtime -7 2>/dev/null | sort || true")"
@@ -458,9 +470,14 @@ check_bundle_log_recent(){
     return 1
   fi
 
-  STAGE1_BUNDLE_FILES="$tgz_out"
-
+  # Exibe box azul — última linha do log (evidência do registro)
   echo ""
+  printf "  ${_C_BLUE}┌─ ${ip}: /var/log/support_bundle.log (última linha) ──────────────────────────${_C_RESET}\n"
+  printf "  ${_C_BLUE}│${_C_RESET}  %s\n" "${last_log_line}"
+  printf "  ${_C_BLUE}└────────────────────────────────────────────────────────────────────────────────${_C_RESET}\n"
+  echo ""
+
+  # Exibe box verde — arquivo(s) .tgz confirmado(s) em file-store
   printf "  ${_C_GREEN}┌─ ${ip}: evidência Stage 1 — arquivo(s) confirmados em file-store (≤ 7 dias) ─────${_C_RESET}\n"
   while IFS= read -r tfile; do
     printf "  ${_C_GREEN}│${_C_RESET}  %s\n" "${tfile}"
@@ -468,7 +485,9 @@ check_bundle_log_recent(){
   printf "  ${_C_GREEN}└────────────────────────────────────────────────────────────────────────────────${_C_RESET}\n"
   echo ""
 
-  log_ok "${ip}: bundle confirmado por evidência em file-store — data do log: ${last_date}."
+  STAGE1_BUNDLE_FILES="$tgz_out"
+
+  log_ok "${ip}: bundle confirmado por evidência física em file-store — data do log: ${last_date}."
   return 0
 }
 
@@ -548,6 +567,8 @@ check_bundle_in_progress(){
 
 # ---------------------------------------------------------------------------
 # prompt_new_bundle IP FILES
+#   Exibe o(s) nome(s) real(is) do(s) arquivo(s) confirmado(s) e pergunta
+#   se o usuário deseja gerar um novo bundle.
 # ---------------------------------------------------------------------------
 prompt_new_bundle(){
   local ip="$1"
@@ -719,16 +740,18 @@ TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_main.sh  — v2.9
+# nsx_sb_main.sh  — v3.0
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v2.9
+# nsx_sb_main.sh  — v3.0
 # Orchestrator: PRE-CHECK (3-stage) + Phase 1 (request SB)
 # Phase 2 (5-min polling) removed — monitoring is done externally.
 #
 # PRE-CHECK stages:
-#   1. check_bundle_log_recent  — log recente só vale se houver evidência: arquivo .tgz em file-store criado nos últimos 7 dias
+#   1. check_bundle_log_recent  — evidência válida: arquivo .tgz em file-store criado nos
+#                                 últimos 7 dias. Exibe box azul (última linha do log) +
+#                                 box verde (nome do arquivo .tgz confirmado).
 #   2. check_existing_bundle    — busca .tgz em file-store ou via 'get files'
 #   3. check_bundle_in_progress — detecta processo ou arquivo parcial em andamento
 set -euo pipefail
@@ -770,10 +793,10 @@ for ip in "${EDGE_IPS[@]}"; do
   check_bundle_log_recent "$ip" || recent_rc=$?
 
   if [[ "$recent_rc" -eq 0 ]]; then
-    log "${ip}: [Stage 1] evidência confirmada em file-store — verificando se usuário quer gerar novo."
+    log "${ip}: [Stage 1] evidência física confirmada em file-store — verificando se usuário quer gerar novo."
     printf '%s,precheck,stage1_log_recent,confirmed,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
-    existing_label="${STAGE1_BUNDLE_FILES}"
-    if ! prompt_new_bundle "$ip" "${existing_label}"; then
+    # STAGE1_BUNDLE_FILES contém o(s) nome(s) real(is) do(s) arquivo(s) .tgz confirmado(s)
+    if ! prompt_new_bundle "$ip" "${STAGE1_BUNDLE_FILES}"; then
       SKIP_SB["$ip"]="true"
       printf '%s,precheck,existing_bundle,skipped_stage1_confirmed,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
     else
@@ -1006,7 +1029,7 @@ cd ~/nsx-edge-automation/automations/support_bundle
 ./nsx_ssh_cli.sh
 ```
 
-## Cores no terminal (v2.9)
+## Cores no terminal (v3.0)
 
 | Cor | Significado |
 |---|---|
@@ -1018,6 +1041,22 @@ cd ~/nsx-edge-automation/automations/support_bundle
 | Ciano negrito | Cabeçalho de fase/seção (log_banner) |
 | Azul | Bordas do box de log ┌ │ └ |
 | Azul negrito | Prompts interativos ao operador |
+
+## Stage 1 — Evidência clara (v3.0)
+
+Quando o script detecta bundle recente via log, dois boxes são exibidos:
+
+```
+  ┌─ IP: /var/log/support_bundle.log (última linha) ──────────────────
+  │  2026-05-14 18:13:55,833 root INFO Support bundle saved to: /var/.../bundle.tgz
+  └────────────────────────────────────────────────────────────────────
+
+  ┌─ IP: evidência Stage 1 — arquivo(s) confirmados em file-store (≤ 7 dias) ──
+  │  /var/vmware/nsx/file-store/support-bundle-172-18-214-18-20260514_122125.tgz
+  └────────────────────────────────────────────────────────────────────────────
+```
+
+O prompt de confirmação exibe apenas o nome real do arquivo .tgz confirmado.
 
 ## Autenticação
 
@@ -1055,8 +1094,16 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "================================================================"
-echo "  Deploy concluído! v2.9"
+echo "  Deploy concluído! v3.0"
 echo "================================================================"
+echo ""
+echo "  Novidades v3.0:"
+echo "    - Stage 1: evidência exibida em 2 boxes separados"
+echo "      Box AZUL  — última linha do /var/log/support_bundle.log"
+echo "      Box VERDE — nome real do arquivo .tgz confirmado em file-store (≤ 7 dias)"
+echo "    - Prompt mostra apenas o nome real do arquivo .tgz (sem '[log recente ≤ 7 dias]')"
+echo "    - STAGE1_BUNDLE_FILES contém exclusivamente o caminho físico do arquivo"
+echo "    - Se log for recente mas arquivo não existir, fluxo avança para Stage 2"
 echo ""
 echo "  Novidades v2.9:"
 echo "    - ANSI color output em todos os scripts (common.sh)"
@@ -1068,13 +1115,6 @@ echo "      log_cmd   magenta    comando SSH enviado (>> cmd)"
 echo "      log_banner ciano     cabeçalho de fase/seção"
 echo "      box ┌│└   azul       bordas do box de log"
 echo "      prompts   azul bold  prompts interativos"
-echo ""
-echo "  Ajuste aplicado neste deploy:"
-echo "    - Stage 1 agora só considera bundle existente com evidência real"
-echo "    - Evidência válida: arquivo support-bundle*.tgz em /var/vmware/nsx/file-store"
-echo "      existente e com mtime nos últimos 7 dias"
-echo "    - O prompt agora mostra o nome real do arquivo confirmado"
-echo "    - Se o log for recente mas não houver arquivo, o fluxo segue para Stage 2"
 echo ""
 echo "  Novidades v2.8:"
 echo "    - check_bundle_log: tail -1 (apenas última linha)"
