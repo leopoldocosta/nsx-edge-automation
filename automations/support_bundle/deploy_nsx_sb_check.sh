@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_nsx_sb_check.sh  v2.8
+# deploy_nsx_sb_check.sh  v2.9
 # Deploy local do kit NSX Edge Automation - Support Bundle
 #
 # USO:
@@ -35,7 +35,7 @@ mkdir -p \
 
 echo ""
 echo "================================================================"
-echo "  NSX Edge Automation — Support Bundle Kit  v2.8"
+echo "  NSX Edge Automation — Support Bundle Kit  v2.9"
 echo "  Destino: ${BASE_DIR}"
 echo "================================================================"
 echo ""
@@ -76,33 +76,48 @@ session.env
 GITIGNORE
 
 # ---------------------------------------------------------------------------
-# lib/common.sh  — v2.8
+# lib/common.sh  — v2.9
 # ---------------------------------------------------------------------------
 cat > "${LIB_DIR}/common.sh" <<'COMMON'
 #!/usr/bin/env bash
-# lib/common.sh  — v2.8
-# Biblioteca compartilhada para todos os scripts NSX Edge Automation.
-# Autenticação: sempre sshpass (senha). Sem chaves SSH.
+# lib/common.sh  — v2.9
+# Shared library for all NSX Edge automations.
+# Provides: SSH access (admin + root), IP loading, credential handling.
 #
-# PRE-CHECK bundle detection (v2.7+) — lógica 3 estágios:
-#   Stage 1: check_bundle_log_recent  — log indica bundle gerado nos últimos 7 dias
-#   Stage 2: check_existing_bundle    — busca .tgz em file-store ou via 'get files'
-#   Stage 3: check_bundle_in_progress — detecta processo ou arquivo parcial em andamento
+# Authentication: always sshpass (password-based). No SSH key logic.
 #
-# FIX v2.8:
-#   - nsx_sb_main.sh: Phase 2 (polling 5 min) removida — monitoramento externo
-#   - SHA stale fix: SHA sempre buscado de refs/heads/main antes de qualquer update
-#   - check_bundle_log: tail -10 → tail -1 (apenas última linha do log)
-# FIX v2.7:
-#   - PRE-CHECK 3-stage logic (log recent / file-store / in-progress)
-# FIX v2.6:
-#   - nsx_sb_main.sh: exibe última linha de support_bundle.log no WARN pending
-# FIX v2.5:
-#   - admin_cmd/root_cmd: stderr suprimido (2>/dev/null)
-#   - admin_cmd_tty/root_cmd_tty: stdout+stderr no terminal
-# FIX v2.4:
-#   - Credenciais persistidas em /dev/shm/.nsx_session_<UID> (tmpfs)
-#   - known_hosts persistente em /tmp/.nsx_known_hosts_<UID>
+# Credential persistence: when user chooses NOT to clear credentials,
+# they are saved to a tmpfs session file (/dev/shm or /tmp) with mode 600.
+#
+# Known hosts: persistent per-UID file in /tmp — "Permanently added"
+# warning appears only on first connection to each IP.
+#
+# stderr isolation: admin_cmd/root_cmd suppress stderr so SSH warnings
+# ("Warning: Permanently added ...") never contaminate captured stdout.
+# This prevents false-positive bundle detection and spurious WARN alerts.
+#
+# PRE-CHECK bundle detection (v2.7) — 3-stage logic:
+#   Stage 1: check_bundle_log_recent — if support_bundle.log shows a bundle
+#            generated within the last 7 days, treat as existing (return 0).
+#   Stage 2: check_existing_bundle   — look for .tgz files in file-store or
+#            via 'get files' (admin CLI).
+#   Stage 3: check_bundle_in_progress — detect an active generation process
+#            (napi/python pid running support_bundle collection).
+#
+# ANSI color output (v2.9):
+#   log       — plain white    (general info)
+#   log_ok    — bold green     (success)
+#   log_warn  — bold yellow    (warnings)
+#   log_err   — bold red       (errors)
+#   log_cmd   — magenta        (SSH commands sent >> cmd)
+#   log_banner— bold cyan      (phase/section headers)
+#   log_box   — blue           (box borders ┌ │ └)
+#   Prompts   — bold blue
+#
+# Usage in any automation script:
+#   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+#   export AUTO_DIR="${SCRIPT_DIR}"
+#   source "${SCRIPT_DIR}/../../lib/common.sh"
 set -euo pipefail
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -115,6 +130,19 @@ EDGE_EXAMPLE="${AUTO_DIR}/edge_nodes.example"
 
 mkdir -p "${LOG_DIR}" "${RUN_DIR}"
 
+# ---------------------------------------------------------------------------
+# ANSI color codes
+# ---------------------------------------------------------------------------
+_C_RESET='\033[0m'
+_C_WHITE='\033[0;37m'
+_C_GREEN='\033[1;32m'
+_C_YELLOW='\033[1;33m'
+_C_RED='\033[1;31m'
+_C_CYAN='\033[1;36m'
+_C_MAGENTA='\033[0;35m'
+_C_BLUE='\033[0;34m'
+_C_BLUE_BOLD='\033[1;34m'
+
 _CRED_DIR="/tmp"
 [[ -d "/dev/shm" ]] && _CRED_DIR="/dev/shm"
 _CRED_FILE="${_CRED_DIR}/.nsx_session_${UID}"
@@ -123,12 +151,26 @@ _KNOWN_HOSTS="/tmp/.nsx_known_hosts_${UID}"
 touch "${_KNOWN_HOSTS}" 2>/dev/null && chmod 600 "${_KNOWN_HOSTS}" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging — color-coded
 # ---------------------------------------------------------------------------
-log(){      printf '[%s] %s\n'        "$(date '+%F %T')" "$*"; }
-log_ok(){   printf '[%s] [OK]   %s\n' "$(date '+%F %T')" "$*"; }
-log_warn(){ printf '[%s] [WARN] %s\n' "$(date '+%F %T')" "$*"; }
-log_err(){  printf '[%s] [ERR]  %s\n' "$(date '+%F %T')" "$*"; }
+log(){
+  printf "${_C_WHITE}[%s] %s${_C_RESET}\n" "$(date '+%F %T')" "$*"
+}
+log_ok(){
+  printf "${_C_GREEN}[%s] [OK]   %s${_C_RESET}\n" "$(date '+%F %T')" "$*"
+}
+log_warn(){
+  printf "${_C_YELLOW}[%s] [WARN] %s${_C_RESET}\n" "$(date '+%F %T')" "$*"
+}
+log_err(){
+  printf "${_C_RED}[%s] [ERR]  %s${_C_RESET}\n" "$(date '+%F %T')" "$*"
+}
+log_cmd(){
+  printf "${_C_MAGENTA}[%s] >> %s${_C_RESET}\n" "$(date '+%F %T')" "$*"
+}
+log_banner(){
+  printf "${_C_CYAN}[%s] === %s ===${_C_RESET}\n" "$(date '+%F %T')" "$*"
+}
 
 # ---------------------------------------------------------------------------
 # Dependency check
@@ -145,12 +187,12 @@ need_cmd(){
 # ---------------------------------------------------------------------------
 collect_ips(){
   if [[ -f "${EDGE_EXAMPLE}" ]]; then
-    echo "  Template: ${EDGE_EXAMPLE}"
-    echo "  Copie com: cp edge_nodes.example edge_nodes.txt e edite."
-    echo "  Ou cole os IPs diretamente abaixo."
+    echo "  Template available: ${EDGE_EXAMPLE}"
+    echo "  Copy with: cp edge_nodes.example edge_nodes.txt, then edit."
+    echo "  Or paste IPs directly below."
   fi
   echo ""
-  echo "Cole os IPs dos Edge Nodes, um por linha. Linha vazia para terminar:"
+  printf "${_C_BLUE_BOLD}Paste Edge Node IPs, one per line. Empty line to finish:${_C_RESET}\n"
   : > "${EDGE_FILE}"
   while IFS= read -r line; do
     [[ -z "$line" ]] && break
@@ -158,25 +200,25 @@ collect_ips(){
     if [[ "$line" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
       echo "$line" >> "${EDGE_FILE}"
     else
-      log_warn "Entrada inválida ignorada: ${line}"
+      log_warn "Skipping invalid entry: ${line}"
     fi
   done
   local count
   count=$(wc -l < "${EDGE_FILE}" | tr -d ' ')
-  log "${count} IP(s) salvos em ${EDGE_FILE}"
+  log "${count} IP(s) saved to ${EDGE_FILE}"
 }
 
 load_ips(){
   if [[ ! -s "${EDGE_FILE}" ]]; then
-    log_warn "${EDGE_FILE} não encontrado ou vazio."
+    log_warn "${EDGE_FILE} not found or empty."
     collect_ips
   fi
   mapfile -t EDGE_IPS < <(grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' "${EDGE_FILE}" 2>/dev/null || true)
   if [[ ${#EDGE_IPS[@]} -eq 0 ]]; then
-    log_err "Nenhum IP válido encontrado em ${EDGE_FILE}."
+    log_err "No valid IPs found in ${EDGE_FILE}."
     exit 1
   fi
-  log "Carregados ${#EDGE_IPS[@]} Edge Node(s): ${EDGE_IPS[*]}"
+  log "Loaded ${#EDGE_IPS[@]} Edge Node(s): ${EDGE_IPS[*]}"
 }
 
 # ---------------------------------------------------------------------------
@@ -218,52 +260,56 @@ _remove_cred_file(){
 }
 
 # ---------------------------------------------------------------------------
-# Credenciais
+# Credentials
 # ---------------------------------------------------------------------------
 ask_admin_creds(){
   if [[ -n "${NSX_PASS:-}" ]]; then
-    log "Credenciais admin já no ambiente (usuário: '${NSX_USER:-admin}'). Pulando prompt."
+    log "Admin credentials already in environment (user: '${NSX_USER:-admin}'). Skipping prompt."
     return 0
   fi
   if _load_creds 2>/dev/null; then
     if [[ -n "${NSX_PASS:-}" ]]; then
-      log "Credenciais admin carregadas do arquivo de sessão (usuário: '${NSX_USER:-admin}'). Pulando prompt."
+      log "Admin credentials loaded from session file (user: '${NSX_USER:-admin}'). Skipping prompt."
       return 0
     fi
   fi
-  read -rp  "Usuário admin [admin]: " NSX_USER
+  printf "${_C_BLUE_BOLD}Usuário admin [admin]: ${_C_RESET}"
+  read -r NSX_USER
   NSX_USER="${NSX_USER:-admin}"
-  IFS= read -rsp "Senha admin (todos os caracteres especiais aceitos): " NSX_PASS; echo
+  printf "${_C_BLUE_BOLD}Senha admin (todos os caracteres especiais aceitos): ${_C_RESET}"
+  IFS= read -rsp "" NSX_PASS; echo
   export NSX_USER NSX_PASS
-  log "Credenciais coletadas para '${NSX_USER}'. Serão reutilizadas em todos os nodes."
+  log "Credenciais coletadas para o usuário '${NSX_USER}'. Serão reutilizadas em todos os nós."
 }
 
 ask_root_creds(){
   if [[ -n "${ROOT_PASS:-}" ]]; then
-    log "Credenciais root já no ambiente. Pulando prompt."
+    log "Root credentials already in environment. Skipping prompt."
     return 0
   fi
   if _load_creds 2>/dev/null; then
     if [[ -n "${ROOT_PASS:-}" ]]; then
-      log "Credenciais root carregadas do arquivo de sessão. Pulando prompt."
+      log "Root credentials loaded from session file. Skipping prompt."
       return 0
     fi
   fi
-  IFS= read -rsp "Senha root (todos os caracteres especiais aceitos): " ROOT_PASS; echo
+  printf "${_C_BLUE_BOLD}Senha root (todos os caracteres especiais aceitos): ${_C_RESET}"
+  IFS= read -rsp "" ROOT_PASS; echo
   export ROOT_PASS
-  log "Credenciais root coletadas. Serão reutilizadas em todos os nodes."
+  log "Root credentials collected. Will be reused for all nodes."
 }
 
 clear_creds(){
   unset NSX_PASS ROOT_PASS NSX_USER 2>/dev/null || true
   _remove_cred_file
   [[ -f "${_KNOWN_HOSTS}" ]] && rm -f "${_KNOWN_HOSTS}" || true
-  log "Credenciais removidas da memória, arquivo de sessão e known_hosts apagados."
+  log "Credentials cleared from memory, session file and known_hosts removed."
 }
 
 prompt_clear_creds(){
   echo ""
-  read -rp "Limpar credenciais da memória? [S/n]: " _CLR
+  printf "${_C_BLUE_BOLD}Limpar credenciais da memória? [S/n]: ${_C_RESET}"
+  read -r _CLR
   if [[ "${_CLR,,}" == "n" ]]; then
     _save_creds
     log "Credenciais mantidas na sessão (${_CRED_FILE})."
@@ -273,9 +319,7 @@ prompt_clear_creds(){
 }
 
 # ---------------------------------------------------------------------------
-# SSH — sempre sshpass, sem chaves
-# admin_cmd / root_cmd: stdout apenas, stderr suprimido (uso programático)
-# admin_cmd_tty / root_cmd_tty: stdout+stderr no terminal (uso interativo)
+# SSH Functions
 # ---------------------------------------------------------------------------
 ssh_admin(){
   local ip="$1"; shift
@@ -303,8 +347,8 @@ ssh_root(){
   return $_rc
 }
 
-admin_cmd(){     local ip="$1" cmd="$2"; ssh_admin "$ip" "$cmd" 2>/dev/null; }
-root_cmd(){      local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>/dev/null; }
+admin_cmd(){ local ip="$1" cmd="$2"; ssh_admin "$ip" "$cmd" 2>/dev/null; }
+root_cmd(){  local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>/dev/null; }
 admin_cmd_tty(){ local ip="$1" cmd="$2"; ssh_admin "$ip" "$cmd" 2>&1; }
 root_cmd_tty(){  local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>&1; }
 
@@ -313,26 +357,26 @@ root_cmd_tty(){  local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>&1; }
 # ---------------------------------------------------------------------------
 enable_root_ssh(){
   local ip="$1"
-  log "${ip}: habilitando root SSH..."
-  log "${ip}: >> set ssh root-login"
+  log "${ip}: enabling root SSH..."
+  log_cmd "${ip}: set ssh root-login"
   admin_cmd_tty "$ip" 'set ssh root-login' || true
-  log "${ip}: >> get service ssh"
+  log_cmd "${ip}: get service ssh"
   admin_cmd_tty "$ip" 'get service ssh' || true
 }
 
 disable_root_ssh(){
   local ip="$1"
-  log "${ip}: desabilitando root SSH..."
-  log "${ip}: >> clear ssh root-login"
+  log "${ip}: disabling root SSH..."
+  log_cmd "${ip}: clear ssh root-login"
   admin_cmd_tty "$ip" 'clear ssh root-login' || true
-  log "${ip}: >> get service ssh"
+  log_cmd "${ip}: get service ssh"
   admin_cmd_tty "$ip" 'get service ssh' || true
 }
 
 # ---------------------------------------------------------------------------
 # check_bundle_log IP
-#   Lê /var/log/support_bundle.log (última linha) e exibe ao operador.
-#   Retorna: 0=ok, 1=erros/warnings no log, 2=arquivo não encontrado
+#   Reads /var/log/support_bundle.log on the node (last line).
+#   Returns: 0=ok, 1=errors/warnings found in log, 2=file not found
 # ---------------------------------------------------------------------------
 check_bundle_log(){
   local ip="$1"
@@ -348,9 +392,9 @@ check_bundle_log(){
   fi
 
   echo ""
-  echo "  ┌─ ${ip}: ${log_file} (última linha) ──────────────────────────"
-  echo "  │  ${out}"
-  echo "  └────────────────────────────────────────────────────────────────"
+  printf "  ${_C_BLUE}┌─ ${ip}: ${log_file} (última linha) ──────────────────────────────${_C_RESET}\n"
+  printf "  ${_C_BLUE}│${_C_RESET}  %s\n" "${out}"
+  printf "  ${_C_BLUE}└────────────────────────────────────────────────────────────────${_C_RESET}\n"
   echo ""
 
   if grep -qiE 'error|fail|exception|abort|fatal' <<< "$out"; then
@@ -364,9 +408,8 @@ check_bundle_log(){
 
 # ---------------------------------------------------------------------------
 # check_bundle_log_recent IP
-#   Stage 1 do PRE-CHECK.
-#   Verifica se o log indica bundle gerado nos últimos 7 dias.
-#   Retorna: 0=bundle recente encontrado, 1=não encontrado, 2=log ausente
+#   Stage 1 of PRE-CHECK.
+#   Returns: 0=recent found, 1=not found, 2=log absent
 # ---------------------------------------------------------------------------
 check_bundle_log_recent(){
   local ip="$1"
@@ -406,9 +449,8 @@ check_bundle_log_recent(){
 
 # ---------------------------------------------------------------------------
 # check_existing_bundle IP
-#   Stage 2 do PRE-CHECK.
-#   Detecta arquivos .tgz de support bundle no file-store ou via 'get files'.
-#   Retorna: 0 com nomes de arquivo em stdout se encontrado, 1 caso contrário
+#   Stage 2 of PRE-CHECK.
+#   Returns 0 with filenames on stdout if found, 1 otherwise.
 # ---------------------------------------------------------------------------
 check_existing_bundle(){
   local ip="$1"
@@ -440,9 +482,8 @@ check_existing_bundle(){
 
 # ---------------------------------------------------------------------------
 # check_bundle_in_progress IP
-#   Stage 3 do PRE-CHECK.
-#   Detecta geração de bundle em andamento via processo ativo ou arquivo parcial.
-#   Retorna: 0=em andamento, 1=nenhuma geração detectada
+#   Stage 3 of PRE-CHECK.
+#   Returns: 0=in progress, 1=not detected
 # ---------------------------------------------------------------------------
 check_bundle_in_progress(){
   local ip="$1"
@@ -489,14 +530,15 @@ prompt_new_bundle(){
   local reply
 
   echo ""
-  echo "  *** Support bundle já existe em ${ip} ***"
-  echo "  Arquivos encontrados:"
+  printf "${_C_YELLOW}  *** Support bundle já existe em ${ip} ***${_C_RESET}\n"
+  printf "${_C_YELLOW}  Arquivos encontrados:${_C_RESET}\n"
   while IFS= read -r f; do
-    echo "    ${f}"
+    printf "${_C_YELLOW}    %s${_C_RESET}\n" "${f}"
   done <<< "$files"
   echo ""
 
-  if read -r -t 10 -p "  Gerar um NOVO support bundle para ${ip}? [s/N] (skip automático em 10s): " reply </dev/tty; then
+  printf "${_C_BLUE_BOLD}  Gerar um NOVO support bundle para ${ip}? [s/N] (skip automático em 10s): ${_C_RESET}"
+  if read -r -t 10 reply </dev/tty; then
     echo ""
     case "${reply,,}" in
       s|y|sim|yes) return 0 ;;
@@ -510,12 +552,12 @@ prompt_new_bundle(){
 }
 
 # ---------------------------------------------------------------------------
-# Support Bundle
+# Support Bundle helpers
 # ---------------------------------------------------------------------------
 request_support_bundle(){
   local ip="$1"
   local fname="sb_${ip//./_}_$(date +%Y%m%d_%H%M%S).tgz"
-  log "${ip}: >> get support-bundle file ${fname} log-age 1"
+  log_cmd "${ip}: get support-bundle file ${fname} log-age 1"
   admin_cmd_tty "$ip" "get support-bundle file ${fname} log-age 1" || true
 }
 
@@ -552,12 +594,6 @@ EXAMPLE
 cat > "${AUTO_DIR}/install_dependencies.sh" <<'INST'
 #!/usr/bin/env bash
 # install_dependencies.sh - Instala sshpass e dependências necessárias.
-# NOTA: Em NSX Edge Nodes (Debian embarcado sem acesso a mirrors externos),
-#       o sshpass deve ser copiado de uma VM Debian/Ubuntu da mesma arquitetura:
-#         apt-get download sshpass
-#         dpkg -x sshpass_*.deb /tmp/sshpass_out
-#         scp /tmp/sshpass_out/usr/bin/sshpass root@<IP_EDGE>:/usr/local/bin/
-#         chmod +x /usr/local/bin/sshpass
 set -euo pipefail
 if command -v sshpass &>/dev/null; then
   echo "[OK] sshpass já instalado: $(command -v sshpass)"
@@ -572,8 +608,8 @@ fi
 if command -v dnf &>/dev/null; then
   dnf install -y sshpass && echo "[OK] sshpass instalado." && exit 0
 fi
-echo "[ERR] Gerenciador de pacotes não reconhecido ou sshpass não disponível nos repos."
-echo "      Em NSX Edge Nodes, copie o binário manualmente de uma VM Debian/Ubuntu amd64:"
+echo "[ERR] Gerenciador de pacotes não reconhecido."
+echo "      Em NSX Edge Nodes, copie o binário manualmente:"
 echo "        apt-get download sshpass"
 echo "        dpkg -x sshpass_*.deb /tmp/sshpass_out"
 echo "        scp /tmp/sshpass_out/usr/bin/sshpass root@<IP_EDGE>:/usr/local/bin/"
@@ -587,8 +623,6 @@ chmod +x "${AUTO_DIR}/install_dependencies.sh"
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/setup_keys.sh" <<'SETUP'
 #!/usr/bin/env bash
-# setup_keys.sh — placeholder
-# Chaves SSH não são usadas nesta versão.
 echo "[INFO] Chaves SSH não são usadas nesta versão."
 echo "[INFO] Autenticação via sshpass (senha)."
 echo "[INFO] Execute ./test_connections.sh para validar."
@@ -621,35 +655,33 @@ for ip in "${EDGE_IPS[@]}"; do
     echo " Node: ${ip}"
     echo "======================================"
 
-    echo "--- [1] Ping ---"
+    log_cmd "${ip}: ping"
     ping -c 1 -W 2 "$ip" 2>&1 || echo "WARN: ping falhou (pode estar filtrado)"
 
-    echo "--- [2] admin: get version ---"
+    log_cmd "${ip}: get version"
     admin_cmd_tty "$ip" 'get version' || echo "FAIL"
 
-    echo "--- [3] admin: get service ssh ---"
+    log_cmd "${ip}: get service ssh"
     admin_cmd_tty "$ip" 'get service ssh' || echo "FAIL"
 
-    echo "--- [4] admin: get managers ---"
+    log_cmd "${ip}: get managers"
     admin_cmd_tty "$ip" 'get managers' || echo "FAIL"
 
-    echo "--- [5] enable root SSH ---"
     enable_root_ssh "$ip"
     sleep 2
 
-    echo "--- [6] root: uname -a ---"
+    log_cmd "${ip}: uname -a"
     root_cmd_tty "$ip" 'uname -a' || echo "FAIL"
 
-    echo "--- [7] root: uptime ---"
+    log_cmd "${ip}: uptime"
     root_cmd_tty "$ip" 'uptime' || echo "FAIL"
 
-    echo "--- [8] root: df -h /var/log ---"
+    log_cmd "${ip}: df -h /var/log"
     root_cmd_tty "$ip" 'df -h /var/log' || echo "FAIL"
 
-    echo "--- [9] presença do log support_bundle.log ---"
+    log_cmd "${ip}: ls support_bundle.log"
     root_cmd_tty "$ip" 'ls -lh /var/log/support_bundle.log 2>/dev/null || echo FILE_NOT_FOUND'
 
-    echo "--- [10] disable root SSH ---"
     disable_root_ssh "$ip"
 
     echo
@@ -662,17 +694,16 @@ TESTC
 chmod +x "${AUTO_DIR}/test_connections.sh"
 
 # ---------------------------------------------------------------------------
-# nsx_sb_main.sh  — v2.8
-# Phase 2 (polling 5 min) removida — monitoramento externo
+# nsx_sb_main.sh  — v2.9
 # ---------------------------------------------------------------------------
 cat > "${AUTO_DIR}/nsx_sb_main.sh" <<'MAIN'
 #!/usr/bin/env bash
-# nsx_sb_main.sh  — v2.8
+# nsx_sb_main.sh  — v2.9
 # Orchestrator: PRE-CHECK (3-stage) + Phase 1 (request SB)
 # Phase 2 (5-min polling) removed — monitoring is done externally.
 #
 # PRE-CHECK stages:
-#   1. check_bundle_log_recent  — se o log indica bundle gerado nos últimos 7 dias → existe
+#   1. check_bundle_log_recent  — log indica bundle gerado nos últimos 7 dias → existe
 #   2. check_existing_bundle    — busca .tgz em file-store ou via 'get files'
 #   3. check_bundle_in_progress — detecta processo ou arquivo parcial em andamento
 set -euo pipefail
@@ -691,7 +722,7 @@ STATUS_CSV="${LOG_DIR}/sb_status_$(date +%Y%m%d_%H%M%S).csv"
 echo 'ip,phase,status,details,timestamp' > "$STATUS_CSV"
 
 # ---- PRE-CHECK: 3-stage bundle detection ----
-log "=== PRE-CHECK: Verificando log e bundles existentes ==="
+log_banner "PRE-CHECK: Verificando log e bundles existentes"
 declare -A SKIP_SB
 for ip in "${EDGE_IPS[@]}"; do
   SKIP_SB["$ip"]="false"
@@ -701,7 +732,6 @@ for ip in "${EDGE_IPS[@]}"; do
   log "${ip}: iniciando PRE-CHECK..."
   enable_root_ssh "$ip"
 
-  # Exibe log (informação ao operador)
   log_rc=0
   check_bundle_log "$ip" || log_rc=$?
   case "$log_rc" in
@@ -710,9 +740,7 @@ for ip in "${EDGE_IPS[@]}"; do
     2) printf '%s,precheck,bundle_log,not_found,%s\n'    "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV" ;;
   esac
 
-  # ------------------------------------------------------------------
-  # Stage 1: log recente (7 dias) → considera bundle como existente
-  # ------------------------------------------------------------------
+  # Stage 1
   recent_rc=0
   check_bundle_log_recent "$ip" || recent_rc=$?
 
@@ -730,9 +758,7 @@ for ip in "${EDGE_IPS[@]}"; do
     continue
   fi
 
-  # ------------------------------------------------------------------
-  # Stage 2: buscar arquivo .tgz em file-store / 'get files'
-  # ------------------------------------------------------------------
+  # Stage 2
   existing_files=""
   if existing_files="$(check_existing_bundle "$ip")"; then
     log "${ip}: [Stage 2] bundle(s) existente(s) encontrado(s) em file-store."
@@ -747,9 +773,7 @@ for ip in "${EDGE_IPS[@]}"; do
     continue
   fi
 
-  # ------------------------------------------------------------------
-  # Stage 3: verificar se há geração em andamento
-  # ------------------------------------------------------------------
+  # Stage 3
   if check_bundle_in_progress "$ip"; then
     log_warn "${ip}: [Stage 3] geração de bundle já está em andamento — pulando solicitação."
     printf '%s,precheck,stage3_in_progress,detected,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
@@ -757,13 +781,12 @@ for ip in "${EDGE_IPS[@]}"; do
     continue
   fi
 
-  # Nenhum bundle detectado — gerar novo
   log "${ip}: nenhum bundle existente ou em andamento — será gerado."
   printf '%s,precheck,existing_bundle,none,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
 done
 
 # ---- PHASE 1: Enable root SSH + Request Support Bundle ----
-log "=== PHASE 1: Support Bundle Request ==="
+log_banner "PHASE 1: Support Bundle Request"
 for ip in "${EDGE_IPS[@]}"; do
   if [[ "${SKIP_SB[$ip]}" == "true" ]]; then
     log "${ip}: pulando solicitação (bundle existente ou em andamento)."
@@ -774,10 +797,10 @@ for ip in "${EDGE_IPS[@]}"; do
   request_support_bundle "$ip"
   printf '%s,phase1,sb_requested,ok,%s\n'     "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
 done
-log "Phase 1 done. Bundles requested — monitoring is done externally."
+log_ok "Phase 1 done. Bundles requested — monitoring is done externally."
 
 # ---- FINAL: Disable root SSH on all nodes ----
-log "=== FINAL: Disabling root SSH ==="
+log_banner "FINAL: Disabling root SSH"
 for ip in "${EDGE_IPS[@]}"; do
   disable_root_ssh "$ip" || true
   printf '%s,final,root_ssh_disabled,ok,%s\n' "$ip" "$(date +%F_%T)" | tee -a "$RUN_LOG" >> "$STATUS_CSV"
@@ -804,11 +827,12 @@ need_cmd sshpass
 load_ips
 ask_admin_creds
 
-read -rp "Comando NSX CLI para executar em todos os nodes: " NSX_CMD
+printf "${_C_BLUE_BOLD}Comando NSX CLI para executar em todos os nodes: ${_C_RESET}"
+read -r NSX_CMD
 [[ -z "${NSX_CMD}" ]] && { log_err "Nenhum comando fornecido."; exit 1; }
 
 for ip in "${EDGE_IPS[@]}"; do
-  log "${ip}: >> ${NSX_CMD}"
+  log_cmd "${ip}: ${NSX_CMD}"
   admin_cmd_tty "$ip" "${NSX_CMD}" || log_warn "${ip}: comando retornou erro"
 done
 
@@ -833,17 +857,16 @@ load_ips
 ask_admin_creds
 ask_root_creds
 
-read -rp "Comando shell para executar em todos os nodes como root: " SHELL_CMD
+printf "${_C_BLUE_BOLD}Comando shell para executar em todos os nodes como root: ${_C_RESET}"
+read -r SHELL_CMD
 [[ -z "${SHELL_CMD}" ]] && { log_err "Nenhum comando fornecido."; exit 1; }
 
 for ip in "${EDGE_IPS[@]}"; do
   log "${ip}: habilitando root SSH..."
   enable_root_ssh "$ip"
   sleep 1
-
-  log "${ip}: >> ${SHELL_CMD}"
+  log_cmd "${ip}: ${SHELL_CMD}"
   root_cmd_tty "$ip" "${SHELL_CMD}" || log_warn "${ip}: comando retornou erro"
-
   log "${ip}: desabilitando root SSH..."
   disable_root_ssh "$ip"
 done
@@ -871,7 +894,8 @@ echo "Nodes disponíveis:"
 for i in "${!EDGE_IPS[@]}"; do
   echo "  [$i] ${EDGE_IPS[$i]}"
 done
-read -rp "Número do node ou IP direto: " SEL
+printf "${_C_BLUE_BOLD}Número do node ou IP direto: ${_C_RESET}"
+read -r SEL
 
 if [[ "$SEL" =~ ^[0-9]+$ ]] && [[ -n "${EDGE_IPS[$SEL]:-}" ]]; then
   TARGET_IP="${EDGE_IPS[$SEL]}"
@@ -879,7 +903,8 @@ else
   TARGET_IP="$SEL"
 fi
 
-read -rp "Usuário [admin]: " LOGIN_USER
+printf "${_C_BLUE_BOLD}Usuário [admin]: ${_C_RESET}"
+read -r LOGIN_USER
 LOGIN_USER="${LOGIN_USER:-admin}"
 
 if [[ "$LOGIN_USER" == "root" ]]; then
@@ -920,20 +945,16 @@ bash install_dependencies.sh
 ```
 
 ### Em NSX Edge Nodes (Debian embarcado, sem acesso a mirrors externos)
-Copie o binário de uma VM Debian/Ubuntu amd64 com acesso à internet:
 ```bash
-# Na VM Debian/Ubuntu:
 apt-get download sshpass
 dpkg -x sshpass_*.deb /tmp/sshpass_out
 scp /tmp/sshpass_out/usr/bin/sshpass root@<IP_EDGE>:/usr/local/bin/
 chmod +x /usr/local/bin/sshpass
-# Validar no Edge:
-sshpass -V
 ```
 
 ## Fluxo de uso
 
-### 1. Deploy (primeira vez ou após reinstalação)
+### 1. Deploy
 ```bash
 curl -fsSL https://raw.githubusercontent.com/leopoldocosta/nsx-edge-automation/main/automations/support_bundle/deploy_nsx_sb_check.sh | bash
 ```
@@ -951,8 +972,8 @@ cd ~/nsx-edge-automation/automations/support_bundle
 
 ### 4. Executar comando em todos os nodes
 ```bash
-./admin_exec.sh   # como admin (NSX CLI)
-./root_exec.sh    # como root (shell)
+./admin_exec.sh
+./root_exec.sh
 ```
 
 ### 5. Sessão SSH interativa
@@ -960,18 +981,25 @@ cd ~/nsx-edge-automation/automations/support_bundle
 ./nsx_ssh_cli.sh
 ```
 
+## Cores no terminal (v2.9)
+
+| Cor | Significado |
+|---|---|
+| Branco | Informação geral (log) |
+| Verde negrito | Sucesso (log_ok) |
+| Amarelo negrito | Aviso / atenção (log_warn) |
+| Vermelho negrito | Erro crítico (log_err) |
+| Magenta | Comando SSH enviado (log_cmd >>cmd) |
+| Ciano negrito | Cabeçalho de fase/seção (log_banner) |
+| Azul | Bordas do box de log ┌ │ └ |
+| Azul negrito | Prompts interativos ao operador |
+
 ## Autenticação
 
 Todos os scripts pedem usuário e senha interativamente na primeira execução.
 Quando o usuário responde "n" ao prompt de limpeza, as credenciais são salvas
 em `/dev/shm/.nsx_session_<UID>` (tmpfs, chmod 600) e recarregadas
-automaticamente pelo próximo script — sem novo prompt.
-
-## Known Hosts
-
-Um arquivo `/tmp/.nsx_known_hosts_<UID>` (chmod 600) é mantido entre execuções.
-O aviso "Permanently added" aparece apenas na **primeira** conexão a cada IP.
-Conexões subsequentes são silenciosas.
+automaticamente pelo próximo script.
 MANUALDOC
 
 # ---------------------------------------------------------------------------
@@ -985,16 +1013,12 @@ cat > "${EXAMPLES_DIR}/ip_list_example.txt" <<'IPEX'
 IPEX
 
 # ---------------------------------------------------------------------------
-# Verificar se sshpass está instalado
+# Verificar sshpass
 # ---------------------------------------------------------------------------
 echo ""
 if ! command -v sshpass &>/dev/null; then
   echo "[WARN] sshpass não encontrado."
-  echo "       Em NSX Edge Nodes, copie o binário manualmente:"
-  echo "         apt-get download sshpass  (em VM Debian/Ubuntu com internet)"
-  echo "         dpkg -x sshpass_*.deb /tmp/sshpass_out"
-  echo "         scp /tmp/sshpass_out/usr/bin/sshpass root@<IP_EDGE>:/usr/local/bin/"
-  echo "         chmod +x /usr/local/bin/sshpass"
+  echo "       Em NSX Edge Nodes, copie o binário manualmente."
   echo "       Ou em servidores com acesso a repos:"
   echo "         bash ${AUTO_DIR}/install_dependencies.sh"
 else
@@ -1006,24 +1030,26 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "================================================================"
-echo "  Deploy concluído! v2.8"
+echo "  Deploy concluído! v2.9"
 echo "================================================================"
 echo ""
+echo "  Novidades v2.9:"
+echo "    - ANSI color output em todos os scripts (common.sh)"
+echo "      log       branco     informação geral"
+echo "      log_ok    verde      sucesso"
+echo "      log_warn  amarelo    aviso"
+echo "      log_err   vermelho   erro crítico"
+echo "      log_cmd   magenta    comando SSH enviado (>> cmd)"
+echo "      log_banner ciano     cabeçalho de fase/seção"
+echo "      box ┌│└   azul       bordas do box de log"
+echo "      prompts   azul bold  prompts interativos"
+echo ""
 echo "  Novidades v2.8:"
-echo "    - nsx_sb_main.sh: Phase 2 (polling a cada 5 min) removida"
-echo "      O monitoramento do bundle deve ser feito externamente."
-echo "    - SHA stale fix: SHA sempre buscado de refs/heads/main antes"
-echo "      de qualquer update para evitar conflitos de cache."
-echo "    - check_bundle_log: tail -10 → tail -1 (apenas última linha)"
+echo "    - check_bundle_log: tail -1 (apenas última linha)"
+echo "    - Phase 2 (polling 5 min) removida — monitoramento externo"
 echo ""
 echo "  Novidades v2.7:"
 echo "    - PRE-CHECK 3 estágios: log recente (7d) / file-store / in-progress"
-echo "    - Stage 1: detecta bundle recente no log (últimos 7 dias)"
-echo "    - Stage 2: detecta .tgz em file-store ou via 'get files'"
-echo "    - Stage 3: detecta geração em andamento (processo ou arquivo parcial)"
-echo ""
-echo "  Novidades v2.6:"
-echo "    - FIX: exibe última linha de /var/log/support_bundle.log no WARN pending"
 echo ""
 echo "Próximos passos:"
 echo "  1. Edite o arquivo de IPs:"

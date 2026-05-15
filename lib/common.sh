@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# lib/common.sh
+# lib/common.sh  — v2.9
 # Shared library for all NSX Edge automations.
 # Provides: SSH access (admin + root), IP loading, credential handling.
 #
@@ -23,6 +23,16 @@
 #   Stage 3: check_bundle_in_progress — detect an active generation process
 #            (napi/python pid running support_bundle collection).
 #
+# ANSI color output (v2.9):
+#   log       — plain white    (general info)
+#   log_ok    — bold green     (success)
+#   log_warn  — bold yellow    (warnings)
+#   log_err   — bold red       (errors)
+#   log_cmd   — magenta        (SSH commands sent >> cmd)
+#   log_banner— bold cyan      (phase/section headers)
+#   log_box   — blue           (box borders ┌ │ └)
+#   Prompts   — bold blue
+#
 # Usage in any automation script:
 #   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #   export AUTO_DIR="${SCRIPT_DIR}"
@@ -42,6 +52,19 @@ EDGE_EXAMPLE="${AUTO_DIR}/edge_nodes.example"
 mkdir -p "${LOG_DIR}" "${RUN_DIR}"
 
 # ---------------------------------------------------------------------------
+# ANSI color codes
+# ---------------------------------------------------------------------------
+_C_RESET='\033[0m'
+_C_WHITE='\033[0;37m'
+_C_GREEN='\033[1;32m'
+_C_YELLOW='\033[1;33m'
+_C_RED='\033[1;31m'
+_C_CYAN='\033[1;36m'
+_C_MAGENTA='\033[0;35m'
+_C_BLUE='\033[0;34m'
+_C_BLUE_BOLD='\033[1;34m'
+
+# ---------------------------------------------------------------------------
 # Session credential file — stored in tmpfs (memory only, never on disk)
 # ---------------------------------------------------------------------------
 _CRED_DIR="/tmp"
@@ -55,12 +78,32 @@ _KNOWN_HOSTS="/tmp/.nsx_known_hosts_${UID}"
 touch "${_KNOWN_HOSTS}" 2>/dev/null && chmod 600 "${_KNOWN_HOSTS}" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging — color-coded output
+#   log        plain white  — general info
+#   log_ok     bold green   — success / confirmed
+#   log_warn   bold yellow  — warning / attention
+#   log_err    bold red     — error / critical
+#   log_cmd    magenta      — SSH command sent (>> cmd)
+#   log_banner bold cyan    — phase/section header
 # ---------------------------------------------------------------------------
-log(){      printf '[%s] %s\n'        "$(date '+%F %T')" "$*"; }
-log_ok(){   printf '[%s] [OK]   %s\n' "$(date '+%F %T')" "$*"; }
-log_warn(){ printf '[%s] [WARN] %s\n' "$(date '+%F %T')" "$*"; }
-log_err(){  printf '[%s] [ERR]  %s\n' "$(date '+%F %T')" "$*"; }
+log(){
+  printf "${_C_WHITE}[%s] %s${_C_RESET}\n" "$(date '+%F %T')" "$*"
+}
+log_ok(){
+  printf "${_C_GREEN}[%s] [OK]   %s${_C_RESET}\n" "$(date '+%F %T')" "$*"
+}
+log_warn(){
+  printf "${_C_YELLOW}[%s] [WARN] %s${_C_RESET}\n" "$(date '+%F %T')" "$*"
+}
+log_err(){
+  printf "${_C_RED}[%s] [ERR]  %s${_C_RESET}\n" "$(date '+%F %T')" "$*"
+}
+log_cmd(){
+  printf "${_C_MAGENTA}[%s] >> %s${_C_RESET}\n" "$(date '+%F %T')" "$*"
+}
+log_banner(){
+  printf "${_C_CYAN}[%s] === %s ===${_C_RESET}\n" "$(date '+%F %T')" "$*"
+}
 
 # ---------------------------------------------------------------------------
 # Dependency check
@@ -82,7 +125,7 @@ collect_ips(){
     echo "  Or paste IPs directly below."
   fi
   echo ""
-  echo "Paste Edge Node IPs, one per line. Empty line to finish:"
+  printf "${_C_BLUE_BOLD}Paste Edge Node IPs, one per line. Empty line to finish:${_C_RESET}\n"
   : > "${EDGE_FILE}"
   while IFS= read -r line; do
     [[ -z "$line" ]] && break
@@ -163,9 +206,11 @@ ask_admin_creds(){
       return 0
     fi
   fi
-  read -rp  "Usuário admin [admin]: " NSX_USER
+  printf "${_C_BLUE_BOLD}Usuário admin [admin]: ${_C_RESET}"
+  read -r NSX_USER
   NSX_USER="${NSX_USER:-admin}"
-  IFS= read -rsp "Senha admin (todos os caracteres especiais aceitos): " NSX_PASS; echo
+  printf "${_C_BLUE_BOLD}Senha admin (todos os caracteres especiais aceitos): ${_C_RESET}"
+  IFS= read -rsp "" NSX_PASS; echo
   export NSX_USER NSX_PASS
   log "Credenciais coletadas para o usuário '${NSX_USER}'. Serão reutilizadas em todos os nós."
 }
@@ -181,7 +226,8 @@ ask_root_creds(){
       return 0
     fi
   fi
-  IFS= read -rsp "Senha root (todos os caracteres especiais aceitos): " ROOT_PASS; echo
+  printf "${_C_BLUE_BOLD}Senha root (todos os caracteres especiais aceitos): ${_C_RESET}"
+  IFS= read -rsp "" ROOT_PASS; echo
   export ROOT_PASS
   log "Root credentials collected. Will be reused for all nodes."
 }
@@ -195,7 +241,8 @@ clear_creds(){
 
 prompt_clear_creds(){
   echo ""
-  read -rp "Limpar credenciais da memória? [S/n]: " _CLR
+  printf "${_C_BLUE_BOLD}Limpar credenciais da memória? [S/n]: ${_C_RESET}"
+  read -r _CLR
   if [[ "${_CLR,,}" == "n" ]]; then
     _save_creds
     log "Credenciais mantidas na sessão (${_CRED_FILE})."
@@ -239,40 +286,37 @@ ssh_root(){
 }
 
 # admin_cmd / root_cmd: stdout only, stderr suppressed
-# Use these for all programmatic output capture.
 admin_cmd(){ local ip="$1" cmd="$2"; ssh_admin "$ip" "$cmd" 2>/dev/null; }
 root_cmd(){  local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>/dev/null; }
 
 # admin_cmd_tty / root_cmd_tty: stdout + stderr to terminal
-# Use these when showing live output to the user (enable/disable root SSH logs).
 admin_cmd_tty(){ local ip="$1" cmd="$2"; ssh_admin "$ip" "$cmd" 2>&1; }
 root_cmd_tty(){  local ip="$1" cmd="$2"; ssh_root  "$ip" "$cmd" 2>&1; }
 
 # ---------------------------------------------------------------------------
 # Root SSH Control
-# Uses *_tty variants so the operator sees live SSH output on the terminal.
 # ---------------------------------------------------------------------------
 enable_root_ssh(){
   local ip="$1"
   log "${ip}: enabling root SSH..."
-  log "${ip}: >> set ssh root-login"
+  log_cmd "${ip}: set ssh root-login"
   admin_cmd_tty "$ip" 'set ssh root-login' || true
-  log "${ip}: >> get service ssh"
+  log_cmd "${ip}: get service ssh"
   admin_cmd_tty "$ip" 'get service ssh' || true
 }
 
 disable_root_ssh(){
   local ip="$1"
   log "${ip}: disabling root SSH..."
-  log "${ip}: >> clear ssh root-login"
+  log_cmd "${ip}: clear ssh root-login"
   admin_cmd_tty "$ip" 'clear ssh root-login' || true
-  log "${ip}: >> get service ssh"
+  log_cmd "${ip}: get service ssh"
   admin_cmd_tty "$ip" 'get service ssh' || true
 }
 
 # ---------------------------------------------------------------------------
 # check_bundle_log IP
-#   Reads /var/log/support_bundle.log on the node (last 10 lines).
+#   Reads /var/log/support_bundle.log on the node (last line).
 #   Uses root_cmd (stderr suppressed) so SSH warnings never appear in output.
 #   Returns: 0=ok, 1=errors/warnings found in log, 2=file not found
 # ---------------------------------------------------------------------------
@@ -281,8 +325,8 @@ check_bundle_log(){
   local log_file="/var/log/support_bundle.log"
   local out
 
-  log "${ip}: lendo ${log_file} (últimas 10 linhas)..."
-  out="$(root_cmd "$ip" "test -f ${log_file} && tail -10 ${log_file} || echo '__FILE_NOT_FOUND__'")"
+  log "${ip}: lendo ${log_file} (última linha)..."
+  out="$(root_cmd "$ip" "test -f ${log_file} && tail -1 ${log_file} || echo '__FILE_NOT_FOUND__'")"
 
   if grep -q '__FILE_NOT_FOUND__' <<< "$out"; then
     log_warn "${ip}: ${log_file} não encontrado — geração anterior pode não ter ocorrido."
@@ -290,29 +334,23 @@ check_bundle_log(){
   fi
 
   echo ""
-  echo "  ┌─ ${ip}: ${log_file} (últimas 10 linhas) ─────────────────────"
-  while IFS= read -r line; do
-    echo "  │  ${line}"
-  done <<< "$out"
-  echo "  └────────────────────────────────────────────────────────────────"
+  printf "  ${_C_BLUE}┌─ ${ip}: ${log_file} (última linha) ──────────────────────────────${_C_RESET}\n"
+  printf "  ${_C_BLUE}│${_C_RESET}  %s\n" "${out}"
+  printf "  ${_C_BLUE}└────────────────────────────────────────────────────────────────${_C_RESET}\n"
   echo ""
 
   if grep -qiE 'error|fail|exception|abort|fatal' <<< "$out"; then
-    log_warn "${ip}: ATENÇÃO — problemas detectados no log da geração anterior (ver acima)."
+    log_warn "${ip}: ATENÇÃO — problema detectado na última linha do log (ver acima)."
     return 1
   fi
 
-  log_ok "${ip}: log da geração anterior sem erros aparentes."
+  log_ok "${ip}: última linha do log sem erros aparentes."
   return 0
 }
 
 # ---------------------------------------------------------------------------
 # check_bundle_log_recent IP
 #   Stage 1 of PRE-CHECK.
-#   Scans /var/log/support_bundle.log for a timestamp indicating that a
-#   support bundle was successfully generated within the last 7 days.
-#   Looks for lines containing date patterns (YYYY-MM-DD) in the last 100
-#   lines and compares to the current epoch minus 7 days.
 #   Returns:
 #     0 — recent bundle found in log (within 7 days)  → treat as existing
 #     1 — no recent bundle timestamp found in log     → proceed to Stage 2
@@ -332,8 +370,6 @@ check_bundle_log_recent(){
     return 2
   fi
 
-  # Extract the most recent YYYY-MM-DD timestamp present in the log.
-  # support_bundle.log uses lines like: "2026-05-14 20:16:01,685 ..."
   local last_date
   last_date="$(grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' <<< "$out" | tail -1 || true)"
 
@@ -342,7 +378,6 @@ check_bundle_log_recent(){
     return 1
   fi
 
-  # Compare dates using epoch seconds (portable: date -d on Linux)
   local log_epoch now_epoch cutoff_epoch
   log_epoch="$(date -d "${last_date}" +%s 2>/dev/null || echo 0)"
   now_epoch="$(date +%s)"
@@ -360,16 +395,12 @@ check_bundle_log_recent(){
 # ---------------------------------------------------------------------------
 # check_existing_bundle IP
 #   Stage 2 of PRE-CHECK.
-#   Detects existing support bundle .tgz files on the node.
-#   Uses admin_cmd/root_cmd (stderr suppressed) so SSH warnings never
-#   appear in found_files, preventing false-positive bundle detection.
 #   Returns 0 with filenames on stdout if found, 1 otherwise.
 # ---------------------------------------------------------------------------
 check_existing_bundle(){
   local ip="$1"
   local found_files=""
 
-  # Strategy 1: admin 'get files'
   local admin_out
   admin_out="$(admin_cmd "$ip" 'get files' || true)"
   if [[ -n "$admin_out" ]]; then
@@ -378,7 +409,6 @@ check_existing_bundle(){
     [[ -n "$admin_matches" ]] && found_files="$admin_matches"
   fi
 
-  # Strategy 2: root ls on file-store (glob for support-bundle*.tgz)
   if [[ -z "$found_files" ]]; then
     local root_out
     root_out="$(root_cmd "$ip" \
@@ -398,12 +428,7 @@ check_existing_bundle(){
 # ---------------------------------------------------------------------------
 # check_bundle_in_progress IP
 #   Stage 3 of PRE-CHECK.
-#   Detects whether a support bundle generation is currently in progress by:
-#     a) Checking for active napi/python processes related to support_bundles
-#     b) Checking for a partial/incomplete .tgz file in file-store
-#   Returns:
-#     0 — generation in progress detected
-#     1 — no active generation detected
+#   Returns: 0 — in progress, 1 — not detected
 # ---------------------------------------------------------------------------
 check_bundle_in_progress(){
   local ip="$1"
@@ -411,7 +436,6 @@ check_bundle_in_progress(){
 
   log "${ip}: [PRE-CHECK Stage 3] verificando geração em andamento..."
 
-  # Check a) active process
   local proc_out
   proc_out="$(root_cmd "$ip" \
     "ps aux 2>/dev/null | grep -iE 'support_bundle|support-bundle|napi.*bundle' | grep -v grep || true")"
@@ -423,7 +447,6 @@ check_bundle_in_progress(){
     found=1
   fi
 
-  # Check b) partial file in file-store (any file modified in the last 30 min)
   local partial_out
   partial_out="$(root_cmd "$ip" \
     "find /var/vmware/nsx/file-store -maxdepth 1 -name 'support-bundle*' -newer /proc/1 -mmin -30 2>/dev/null || true")"
@@ -452,14 +475,15 @@ prompt_new_bundle(){
   local reply
 
   echo ""
-  echo "  *** Support bundle já existe em ${ip} ***"
-  echo "  Arquivos encontrados:"
+  printf "${_C_YELLOW}  *** Support bundle já existe em ${ip} ***${_C_RESET}\n"
+  printf "${_C_YELLOW}  Arquivos encontrados:${_C_RESET}\n"
   while IFS= read -r f; do
-    echo "    ${f}"
+    printf "${_C_YELLOW}    %s${_C_RESET}\n" "${f}"
   done <<< "$files"
   echo ""
 
-  if read -r -t 10 -p "  Gerar um NOVO support bundle para ${ip}? [s/N] (skip automático em 10s): " reply </dev/tty; then
+  printf "${_C_BLUE_BOLD}  Gerar um NOVO support bundle para ${ip}? [s/N] (skip automático em 10s): ${_C_RESET}"
+  if read -r -t 10 reply </dev/tty; then
     echo ""
     case "${reply,,}" in
       s|y|sim|yes) return 0 ;;
@@ -478,7 +502,7 @@ prompt_new_bundle(){
 request_support_bundle(){
   local ip="$1"
   local fname="sb_${ip//./_}_$(date +%Y%m%d_%H%M%S).tgz"
-  log "${ip}: >> get support-bundle file ${fname} log-age 1"
+  log_cmd "${ip}: get support-bundle file ${fname} log-age 1"
   admin_cmd_tty "$ip" "get support-bundle file ${fname} log-age 1" || true
 }
 
